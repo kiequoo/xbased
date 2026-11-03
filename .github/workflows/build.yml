@@ -1,0 +1,61 @@
+name: Build
+
+on:
+  push:
+    branches: [main, arm64-linux]
+  pull_request:
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive   # picks up external/fex and its submodules
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            git clang lld cmake ninja-build pkg-config python3 zlib1g-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxss-dev libxtst-dev libxfixes-dev \
+            libxkbcommon-dev libwayland-dev wayland-protocols \
+            libegl-dev libgl-dev libdecor-0-dev \
+            libdrm-dev libgbm-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev \
+            libudev-dev libdbus-1-dev libibus-1.0-dev
+
+      - name: Fetch third-party sources
+        run: |
+          chmod +x tools/fetch_deps.sh
+          tools/fetch_deps.sh ../deps
+
+      - name: Configure
+        run: |
+          cmake -S native -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+            -DNC_DEPS=../deps
+
+      - name: Build
+        run: cmake --build build --target hakux
+
+      - name: Package AppImage
+        run: |
+          chmod +x tools/release/package_linux.sh
+          tools/release/package_linux.sh build dist "${GITHUB_REF_NAME}"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: xbased-linux-${{ matrix.arch }}
+          path: dist/xbased-*.AppImage
