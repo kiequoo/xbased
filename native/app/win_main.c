@@ -904,7 +904,7 @@ int main(int argc, char *argv[])
     }
     nc_vsync_start();
     nc_auto_init(g_data_dir, save_state, load_state);
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(__aarch64__) && defined(__linux__))
     nc_core_fault_install(&g_core);
 #endif
     pads_changed();

@@ -91,10 +91,11 @@ if(NC_LINUX_X64)
   set(NC_CPU_LIB nc_zydis)
   set(NC_SYS_LIBS pthread dl m)
 elseif(NC_LINUX_ARM64)
-  # FEX as the CPU backend, desktop frontend (app_win.cmake): no SEH shim
-  # (FEX handles its own signals), but linux.c for the system-property shim
-  # and thread helpers that NC_DESKTOP code expects.
-  set(NC_PLATFORM_SOURCES core/jmp.c core/vm.c cpu/cpu.cpp compat/linux/linux.c)
+  # FEX as the CPU backend, desktop frontend (app_win.cmake): no SEH shim;
+  # the core's faults (MMIO, dirty tracking, call-ret) go through a plain
+  # SIGSEGV/SIGBUS handler (core/fault_linux_arm64.c) as on Android. linux.c
+  # for the system-property shim and thread helpers NC_DESKTOP code expects.
+  set(NC_PLATFORM_SOURCES core/jmp.c core/vm.c core/fault_linux_arm64.c cpu/cpu.cpp compat/linux/linux.c)
   set(NC_CPU_LIB nc_fex)
   set(NC_SYS_LIBS pthread dl m)
 elseif(WIN32)

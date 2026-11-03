@@ -45,9 +45,10 @@ void nc_core_run(NcCore *c);
  * SIGSEGV/SIGBUS handler calls this first; true means handled (return from
  * the handler), false that the fault is someone else's. */
 bool nc_core_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext);
-#if defined(__x86_64__)
+#if defined(__x86_64__) || (defined(__aarch64__) && defined(__linux__) && !defined(__ANDROID__))
 /* x86-64 (fault_win.c; on Linux over SIGSEGV): a vectored exception handler that hands the
- * process's access violations to nc_core_fault for c. */
+ * process's access violations to nc_core_fault for c. arm64 Linux (fault_linux_arm64.c):
+ * a SIGSEGV/SIGBUS handler, as Android's front end installs. */
 void nc_core_fault_install(NcCore *c);
 #endif
 
