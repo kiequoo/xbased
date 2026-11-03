@@ -81,6 +81,46 @@ tools/release/package_linux.sh ../build/linux
 The release AppImage is built on Ubuntu 22.04, so it runs on that and newer
 distributions.
 
+## Linux (arm64)
+
+Tested on devices running a full Linux desktop (Wayland/X11, glibc 2.35+, Mesa
+Vulkan). On Adreno hardware the system Vulkan driver must support Vulkan 1.1.
+
+Ubuntu/Debian packages (same set as Linux x86-64):
+
+```bash
+sudo apt install git clang lld cmake ninja-build pkg-config python3 zlib1g-dev \
+  libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxtst-dev libxfixes-dev \
+  libxkbcommon-dev libwayland-dev wayland-protocols libegl-dev libgl-dev libdecor-0-dev \
+  libdrm-dev libgbm-dev libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev \
+  libdbus-1-dev libibus-1.0-dev
+```
+
+Then:
+
+```bash
+git clone https://github.com/crazyriddler/xbased
+cd xbased
+# Initialise the FEX fork (the arm64 CPU backend) and its required submodules:
+git submodule update --init external/fex
+git -C external/fex submodule update --init \
+  External/fmt External/range-v3 External/rpmalloc \
+  External/unordered_dense External/xxhash Source/Common/cpp-optparse
+# Fetch the remaining third-party sources (SDL3, Vulkan libs, etc.):
+tools/fetch_deps.sh
+cmake -S native -B ../build/linux-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build ../build/linux-arm64 --target hakux
+```
+
+Pass `-DHAKUX_ARCH=armv8.2-a+fp16+dotprod+rcpc` (or a higher `-march` your
+device supports) to enable CPU-specific code generation in FEX and the core.
+Snapdragon 8 Elite (Oryon, ARMv9.2-a) can take `-DHAKUX_ARCH=armv9-a`.
+
+`../build/linux-arm64/xbased` runs from the build folder.  Settings, saves and
+states go to `~/.local/share/xbased` (or beside the executable when a
+`portable.txt` is there).
+
 ## Options
 
 | CMake option | Default | Meaning |
