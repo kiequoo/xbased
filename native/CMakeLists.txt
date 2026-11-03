@@ -29,8 +29,15 @@ get_filename_component(NC_REPO "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
   set(NC_LINUX_X64 ON)
 endif()
+# Linux on arm64 (not Android): FEX as the CPU backend, SDL3 desktop frontend.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  set(NC_LINUX_ARM64 ON)
+endif()
 if(NC_LINUX_X64)
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/linux.cmake")
+elseif(NC_LINUX_ARM64)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/linux_arm64.cmake")
+  set(NC_XXHASH_DIR "${HAKUX_FEX_DIR}/External/xxhash")
 elseif(WIN32)
   # Windows x64: the guest CPU is the core's own x86-32 -> x86-64 translator
   # (cpu/cpu_x86.cpp, on Zydis) instead of FEX; cmake/win.cmake.
@@ -74,7 +81,7 @@ target_include_directories(nc_slirp BEFORE PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/
 target_include_directories(nc_slirp PUBLIC "${CMAKE_BINARY_DIR}/slirp")
 target_link_libraries(nc_slirp PRIVATE nc_glib)
 target_compile_options(nc_slirp PRIVATE -w)
-if(NC_LINUX_X64)
+if(NC_LINUX_X64 OR NC_LINUX_ARM64)
   target_compile_options(nc_slirp PRIVATE "SHELL:-include signal.h")   # misc.c's (Android's headers bring it)
 endif()
 
@@ -82,6 +89,13 @@ if(NC_LINUX_X64)
   set(NC_PLATFORM_SOURCES core/vm.c core/fault_win.c core/jmp_x64.c cpu/cpu_x86.cpp cpu/x64emu.cpp
       compat/linux/seh.c compat/linux/linux.c)
   set(NC_CPU_LIB nc_zydis)
+  set(NC_SYS_LIBS pthread dl m)
+elseif(NC_LINUX_ARM64)
+  # FEX as the CPU backend, desktop frontend (app_win.cmake): no SEH shim
+  # (FEX handles its own signals), but linux.c for the system-property shim
+  # and thread helpers that NC_DESKTOP code expects.
+  set(NC_PLATFORM_SOURCES core/jmp.c core/vm.c cpu/cpu.cpp compat/linux/linux.c)
+  set(NC_CPU_LIB nc_fex)
   set(NC_SYS_LIBS pthread dl m)
 elseif(WIN32)
   set(NC_PLATFORM_SOURCES core/vm.c core/vm_win.cpp core/fault_win.c core/jmp_x64.c cpu/cpu_x86.cpp cpu/x64emu.cpp compat/win/win.c)
@@ -153,7 +167,7 @@ target_compile_options(hakux_native PRIVATE -Wall -Wno-unused-parameter)
 # xboxrun's custom Vulkan driver ("vkdriver="): the app's code for it
 # (native/app/vkdriver.c, vklayer.c), through adrenotools when NC_DEPS has it
 # (cmake/app.cmake).
-if(WIN32 OR NC_LINUX_X64)
+if(WIN32 OR NC_LINUX_X64 OR NC_LINUX_ARM64)
   add_executable(xboxrun EXCLUDE_FROM_ALL run/xboxrun.c run/capture.c)
   target_link_libraries(xboxrun PRIVATE hakux_native hakux_hle z)
 else()
@@ -164,8 +178,8 @@ target_link_libraries(hakux_hle PUBLIC hakux_native)
 target_link_libraries(nc_slirp PRIVATE hakux_native)   # nc_log
 
 # The hakuX app's native core library (native/app, cmake/app.cmake); on
-# Windows the hakuX executable (native/app/win_main.c, cmake/app_win.cmake).
-if(WIN32 OR NC_LINUX_X64)
+# Windows and Linux the hakuX executable (native/app/win_main.c, cmake/app_win.cmake).
+if(WIN32 OR NC_LINUX_X64 OR NC_LINUX_ARM64)
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/app_win.cmake")
 else()
   include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/app.cmake")
@@ -176,6 +190,6 @@ if(WIN32)
   if(TARGET hakux)
     nc_win_compat(hakux)
   endif()
-elseif(NC_LINUX_X64)
+elseif(NC_LINUX_X64 OR NC_LINUX_ARM64)
   nc_linux_compat(hakux_native hakux_hle hakux_apu nc_glib nc_slirp xboxrun hakux)
 endif()
