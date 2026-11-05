@@ -23,11 +23,13 @@
 #include <sys/stat.h>
 #endif
 
-#define REPO "crazyriddler/xbased"
+#define REPO "kiequoo/xbased-arm64"
 #define API "https://api.github.com/repos/" REPO "/releases/latest"
 #define UPD_OLD ".xbased-old"
 #ifdef _WIN32
 #define ASSET_SUFFIX "-windows-x64.zip"
+#elif defined(__aarch64__)
+#define ASSET_SUFFIX "-aarch64.AppImage"
 #else
 #define ASSET_SUFFIX "-x86_64.AppImage"
 #endif
