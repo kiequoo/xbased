@@ -72,7 +72,7 @@ Requires: `sudo pacman -S aarch64-linux-gnu-gcc aarch64-linux-gnu-glibc aarch64-
 
 ## Test device
 
-AYN Odin 3 running Armada OS: `ssh armada@192.168.68.36`
+AYN Odin 3 running Armada OS: `ssh armada@192.168.68.30`
 AppImage at `~/Applications/xbased.AppImage`
 
 ## Commit style
