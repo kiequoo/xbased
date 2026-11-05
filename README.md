@@ -25,6 +25,20 @@
   <a href="#credits">Credits</a>
 </p>
 
+---
+
+> **This is a fork of [crazyriddler/xbased](https://github.com/crazyriddler/xbased) that adds arm64 Linux support** for Linux handhelds (AYN Odin, etc. running a full Wayland/X11 desktop). All emulator credit goes to the upstream project.
+>
+> **What this fork adds:**
+> - arm64 Linux build target (FEX x86→arm64 CPU backend + SDL3 desktop frontend)
+> - A/B–X/Y glyph swap toggle — relabels on-screen button hints without changing button actions
+> - Controller button icons shown immediately when a controller is detected
+> - EmuDeck-style Select-modifier combos: Select+Start=quit, +R3=menu, +R1=save, +L1=load, +Y=screenshot, +L3=pause, +R2=fast-forward
+>
+> **[Download arm64 Linux AppImage](https://github.com/kiequoo/xbased-arm64/releases/latest)** · [Build from source](BUILDING.md)
+
+---
+
 <!-- trailer -->
 https://github.com/user-attachments/assets/bf62adff-002a-4dc6-9b28-eee775181646
 

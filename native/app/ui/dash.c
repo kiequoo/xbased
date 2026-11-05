@@ -401,6 +401,11 @@ static void poll_input(void)
         in->repeat = true;
         g_rep_at = ui_time() + 0.09;
     }
+    /* show gamepad glyphs whenever a controller is connected; fall back to
+     * keyboard glyphs only when nothing is plugged in */
+    for (int i = 0; i < 8; i++) {
+        if (g_pads[i]) { in->pad = true; break; }
+    }
 }
 
 /* Scripted input and pictures (tests): HAKUX_AUTO_CMD=<file>, a command a
@@ -523,9 +528,10 @@ void draw_button_glyph(float x, float y, int which, float size)
     static const char *const k_pad[4] = {"A", "B", "X", "Y"};
     static const char *const k_key[4] = {"Enter", "Esc", "Del", "Tab"};
     if (D.in.pad) {
-        ui_circle(x + size / 2, y + size / 2, size / 2, k_col[which]);
-        ui_glow(x + size / 2, y + size / 2, size, ui_alpha(k_col[which], 0.35f));
-        ui_text(x + size / 2, y + size * 0.06f, k_pad[which], size * 0.8f, UI_FONT_BOLD, UI_WHITE, UI_ALIGN_CENTER);
+        const int gi = cfg_bool(&D.global, "ui.swapab", false) ? (which ^ 1) : which;
+        ui_circle(x + size / 2, y + size / 2, size / 2, k_col[gi]);
+        ui_glow(x + size / 2, y + size / 2, size, ui_alpha(k_col[gi], 0.35f));
+        ui_text(x + size / 2, y + size * 0.06f, k_pad[gi], size * 0.8f, UI_FONT_BOLD, UI_WHITE, UI_ALIGN_CENTER);
     } else {
         const float w = ui_text_width(k_key[which], size * 0.62f, UI_FONT_BOLD) + size * 0.6f;
         ui_round(x, y + size * 0.08f, w, size * 0.84f, 5, ui_alpha(UI_WHITE, 0.9f));

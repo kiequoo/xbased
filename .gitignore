@@ -46,6 +46,7 @@ profile-out-*/
 !/tools/mods/
 !/tools/release/
 !/tools/brand/
+!/tools/build_local.sh
 !/tools/fetch_deps.sh
 
 # Shared build/device lock between sessions (not versioned)
