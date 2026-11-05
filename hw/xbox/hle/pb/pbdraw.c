@@ -498,6 +498,9 @@ static struct {
     bool moded;
 } g_saved_disp;
 static bool g_restored_display;         /* a savestate loaded: the display set at its first swap */
+/* The display is a boot's first target, the video mode not set yet: CreateDevice binds its back
+ * buffer before AvSetDisplayMode, and that buffer needn't be the frame's size (linear_size) */
+static bool g_disp_guess;
 
 /* The device, at the first render target: the display is that target's
  * size, or the video mode's (mode_sync). */
@@ -521,6 +524,7 @@ static void device(uint32_t w, uint32_t h)
     if (g_saved_disp.w && g_saved_disp.h) {
         g_restored_display = false;         /* sized by the mode or the state, not a guess */
     }
+    g_disp_guess = !g_disp_moded && !(g_saved_disp.w && g_saved_disp.h);
     g_saved_disp.w = g_saved_disp.h = 0;
     HleCmdDevice *c = begin(HLE_OP_DEVICE_CREATE, sizeof(*c));
     c->disp_w = w;
@@ -581,10 +585,16 @@ static void linear_size(uint32_t pitch, uint32_t xfmt, uint32_t sx, uint32_t sy,
         const char *e = getenv("HAKUX_HLE_PB_TILEW");
         tilew = !e || strcmp(e, "0");
     }
+    /* As tall as the display only once it's the video mode's (or a savestate's): a guess from the
+     * first target bound is a boot's back buffer, and Hunter: The Reckoning - Redeemer's is its
+     * 640 x 960 supersampled one. Its two 640 x 480 front buffers, cleared before the mode was set,
+     * were taken for 640 x 960, and their first write-back ran 480 rows past each, over the
+     * DirectSound voices the title keeps behind them: a NULL pointer at the copyright screen. */
+    const uint32_t dh = g_disp_guess ? 0 : g_pd.disp_h;
     const uint32_t dw = g_pd.disp_w * sx;
     if (tilew && dw && sy == 1 && *w <= dw && pw > dw && pitch == tile_pitch(dw * bytes)) {
         *w = dw;
-        *h = MAX(*h, g_pd.disp_h);
+        *h = MAX(*h, dh);
         return;
     }
     /* an antialiased view whose samples are the display's pixels: the same
@@ -596,14 +606,14 @@ static void linear_size(uint32_t pitch, uint32_t xfmt, uint32_t sx, uint32_t sy,
     if (tilew && g_pd.disp_w && sx > 1 && *w <= g_pd.disp_w && pw > g_pd.disp_w &&
         pitch == tile_pitch(g_pd.disp_w * bytes)) {
         *w = g_pd.disp_w;
-        *h = MAX(*h, g_pd.disp_h);
+        *h = MAX(*h, dh);
         return;
     }
     /* not with vertical antialiasing: a 2x2 view of a display-wide surface
      * covers its rows in half the lines (Forza draws 640 x 240 2x2 into its
      * 1280 x 480 scene target, which a texture then samples) */
     if (g_pd.disp_w && pw == g_pd.disp_w * sx && sy == 1) {
-        *h = MAX(*h, g_pd.disp_h);
+        *h = MAX(*h, dh);
     }
     *w = pw;
 }
@@ -1071,6 +1081,7 @@ static void mode_sync(void)
     }
     g_mode_seen = seq;
     g_disp_moded = ok;
+    g_disp_guess = g_disp_guess && !ok;
     if (!ok || (w == g_pd.disp_w && h == g_pd.disp_h)) {
         return;
     }

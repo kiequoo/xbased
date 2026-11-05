@@ -11,8 +11,8 @@
 1 24 "xbased.manifest"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,0,28,0
-PRODUCTVERSION 1,0,28,0
+FILEVERSION 1,0,29,0
+PRODUCTVERSION 1,0,29,0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -22,11 +22,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "crazyriddler"
             VALUE "FileDescription", "xbased - original Xbox emulator by crazyriddler"
-            VALUE "FileVersion", "1.0.28"
+            VALUE "FileVersion", "1.0.29"
             VALUE "InternalName", "xbased"
             VALUE "OriginalFilename", "xbased.exe"
             VALUE "ProductName", "xbased"
-            VALUE "ProductVersion", "1.0.28"
+            VALUE "ProductVersion", "1.0.29"
         END
     END
     BLOCK "VarFileInfo"

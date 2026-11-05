@@ -1,5 +1,16 @@
 # xbased changelog
 
+## 1.0.29 (2026-11)
+
+### Fixes
+- Hunter: The Reckoning - Redeemer crashed at the copyright screen and
+  stayed black (on every boot once its cache was on the hard disk). Its back
+  buffer is a supersampled 640 x 960 one, bound before the video mode is
+  set, and the two 640 x 480 front buffers cleared then were taken for
+  640 x 960. Writing one back to memory ran 480 rows past its end, over the
+  game's sound data. Until the video mode is known a target is now as tall
+  as it's drawn, not as tall as that first buffer.
+
 ## 1.0.28 (2026-11)
 
 ### Changes
