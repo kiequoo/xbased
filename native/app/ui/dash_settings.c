@@ -215,6 +215,7 @@ void scr_settings(void)
         opt_bool(&l, S_ANIMATED_BG, "ui.anim", true, false);
         opt_bool(&l, S_UI_SOUNDS, "ui.sounds", true, false);
         opt_bool(&l, S_CHECK_UPDATES, "update.check", true, false);
+        opt_bool(&l, S_SWAP_AB, "ui.swapab", false, false);
         const char *dirs[16];
         const int nd = cfg_all(&D.global, "gamedir", dirs, 16);
         for (int i = 0; i < nd; i++) {

@@ -3,21 +3,33 @@ name: Build
 on:
   push:
     branches: [main, arm64-linux]
+    tags: ['v*']
   pull_request:
 
 jobs:
   build:
-    name: ${{ matrix.arch }}
-    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x86_64, aarch64]
+    name: aarch64
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write   # needed for gh release create
 
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive   # picks up external/fex and its submodules
+
+      - name: Cache third-party deps
+        uses: actions/cache@v4
+        with:
+          path: ../deps
+          key: deps-aarch64-${{ hashFiles('tools/fetch_deps.sh') }}
+
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/sccache
+          key: sccache-${{ runner.os }}-aarch64-${{ github.sha }}
+          restore-keys: sccache-${{ runner.os }}-aarch64-
 
       - name: Install dependencies
         run: |
@@ -30,12 +42,22 @@ jobs:
             libegl-dev libgl-dev libdecor-0-dev \
             libdrm-dev libgbm-dev \
             libasound2-dev libpulse-dev libpipewire-0.3-dev \
-            libudev-dev libdbus-1-dev libibus-1.0-dev
+            libudev-dev libdbus-1-dev libibus-1.0-dev \
+            sccache
 
       - name: Fetch third-party sources
         run: |
           chmod +x tools/fetch_deps.sh
           tools/fetch_deps.sh ../deps
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "pkg=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "pkg=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Configure
         run: |
@@ -44,18 +66,33 @@ jobs:
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DNC_DEPS=../deps
 
       - name: Build
         run: cmake --build build --target hakux
 
+      - name: sccache stats
+        run: sccache --show-stats
+
       - name: Package AppImage
         run: |
           chmod +x tools/release/package_linux.sh
-          tools/release/package_linux.sh build dist "${GITHUB_REF_NAME}"
+          tools/release/package_linux.sh build dist "${{ steps.ver.outputs.pkg }}"
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
-          name: xbased-linux-${{ matrix.arch }}
+          name: xbased-arm64-linux-aarch64
           path: dist/xbased-*.AppImage
+
+      - name: Create GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/xbased-*.AppImage \
+            --repo kiequoo/xbased-arm64 \
+            --title "xbased-arm64 ${{ github.ref_name }}" \
+            --notes "arm64 Linux AppImage. Download, \`chmod +x\`, and run."
