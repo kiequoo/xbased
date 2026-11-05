@@ -1204,3 +1204,65 @@ bool xi_take_report(XiReport *out)
     *out = g_report;
     return true;
 }
+
+/* ------------------------------------------------------------ downloads */
+
+/* ContentMeta.xbx files under dir, depth levels down: each one signed for
+ * this console (HMAC(HMAC(HD key, its title id at 0x24), its header) at 0),
+ * re-signed where it isn't. */
+static int resign_tree(const char *dir, int depth, const uint8_t hd[16])
+{
+    int done = 0, n = 0;
+    char **names = SDL_GlobDirectory(dir, NULL, 0, &n);
+    for (int i = 0; names && i < n; i++) {
+        char p[1400];
+        snprintf(p, sizeof(p), "%s/%s", dir, names[i]);
+        SDL_PathInfo pi;
+        if (!SDL_GetPathInfo(p, &pi)) {
+            continue;
+        }
+        if (pi.type == SDL_PATHTYPE_DIRECTORY && depth > 0) {
+            done += resign_tree(p, depth - 1, hd);
+            continue;
+        }
+        if (pi.type != SDL_PATHTYPE_FILE || SDL_strcasecmp(names[i], "ContentMeta.xbx")) {
+            continue;
+        }
+        size_t len = 0;
+        uint8_t *d = load(p, &len);
+        const uint32_t size = d && len >= 0x28 ? rd32le(d + 0x18) : 0;
+        if (size > 0x14 && size <= len) {
+            uint8_t ck[20], sig[20];
+            hmac(hd, 16, d + 0x24, 4, ck);
+            hmac(ck, 20, d + 0x14, size - 0x14, sig);
+            if (memcmp(d, sig, 20)) {
+                write_at(p, 0, sig);
+                done++;
+            }
+        }
+        SDL_free(d);
+    }
+    SDL_free(names);
+    return done;
+}
+
+int xi_resign_downloads(const char *hdd, uint32_t title_id)
+{
+    char tdata[1200];
+    snprintf(tdata, sizeof(tdata), "%s/Partition1/TDATA", hdd);
+    char want[16];
+    snprintf(want, sizeof(want), "%08x", title_id);
+    uint8_t hd[16];
+    native_hd_key(hdd, hd);
+    int done = 0, n = 0;
+    char **names = SDL_GlobDirectory(tdata, NULL, 0, &n);
+    for (int i = 0; names && i < n; i++) {
+        if (!SDL_strcasecmp(names[i], want)) {     /* the folder's name in either case */
+            char p[1300];
+            snprintf(p, sizeof(p), "%s/%s", tdata, names[i]);
+            done += resign_tree(p, 3, hd);
+        }
+    }
+    SDL_free(names);
+    return done;
+}

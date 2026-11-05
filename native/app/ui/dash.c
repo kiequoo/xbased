@@ -5,6 +5,7 @@
  */
 #include "native/app/ui/dash.h"
 #include "native/app/ui/dash_int.h"
+#include "native/app/ui/shortcut.h"
 #include "native/app/ui/sound.h"
 #include "native/app/ui/update.h"
 
@@ -18,7 +19,7 @@
 #endif
 
 #ifndef XBASED_VERSION
-#define XBASED_VERSION "1.0.21"
+#define XBASED_VERSION "1.0.22"
 #endif
 
 Dash D;
@@ -577,9 +578,20 @@ void draw_header(const char *title, const char *sub)
 #else
     localtime_r(&now, &tmv);
 #endif
-    char clk[16];
-    snprintf(clk, sizeof(clk), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
-    ui_text(W - 60, 40, clk, 30, UI_FONT_BOLD, UI_GREEN, UI_ALIGN_RIGHT);
+    ui_text(W - 60, 40, dash_hm(tmv.tm_hour, tmv.tm_min), 30, UI_FONT_BOLD, UI_GREEN, UI_ALIGN_RIGHT);
+}
+
+const char *dash_hm(int hour, int minute)
+{
+    static char b[4][16];
+    static int k;
+    k = (k + 1) & 3;
+    if (cfg_bool(&D.global, "ui.clock12", false)) {
+        snprintf(b[k], sizeof(b[k]), "%d:%02d %s", hour % 12 ? hour % 12 : 12, minute, hour < 12 ? "AM" : "PM");
+    } else {
+        snprintf(b[k], sizeof(b[k]), "%02d:%02d", hour, minute);
+    }
+    return b[k];
 }
 
 /* ------------------------------------------------------------ lists */
@@ -1100,6 +1112,9 @@ static void scr_main(void)
 
 static void draw_card(LibGame *g, float x, float y, float w, float h, bool sel, float alpha)
 {
+    if (g->hidden) {
+        alpha *= 0.45f;     /* a hidden game, shown (Show hidden games) */
+    }
     if (sel) {
         ui_glow(x + w / 2, y + h / 2, w * 1.1f, ui_alpha(UI_GREEN, 0.35f * alpha));
     }
@@ -1138,6 +1153,8 @@ static void open_game(LibGame *g)
 static void scr_games(void)
 {
     const float W = ui_w(), H = ui_h();
+    /* hidden games left out here only (the rest of the dashboard sees them all) */
+    lib_show_hidden(cfg_bool(&D.global, "ui.showhidden", false));
     const int n = lib_count();
     char sub[160];
     if (lib_scanning()) {
@@ -1271,6 +1288,59 @@ static void scr_games(void)
 
 /* ------------------------------------------------------------ a game */
 
+static char g_cover_file[1024];
+static SDL_AtomicInt g_cover_file_set;
+
+static void SDLCALL cover_file_cb(void *ud, const char *const *files, int filter)
+{
+    (void)ud;
+    (void)filter;
+    if (files && files[0] && !SDL_GetAtomicInt(&g_cover_file_set)) {
+        snprintf(g_cover_file, sizeof(g_cover_file), "%s", files[0]);
+        SDL_SetAtomicInt(&g_cover_file_set, 1);
+    }
+}
+
+/* The game's name, edited in place: Enter (A) to type and again to keep,
+ * Esc to leave it; kept empty, the disc's own again. */
+static void rename_row(List *l, LibGame *g)
+{
+    static const char k_rename[] = "rename";
+    const bool editing = D.edit_key == k_rename;
+    char shown[300];
+    snprintf(shown, sizeof(shown), "%s%s", editing ? D.edit_tmp : g->g.title,
+             editing && (int)(ui_time() * 2) % 2 ? "_" : "");
+    if (list_row(l, T(S_RENAME), shown, NULL)) {
+        if (editing) {
+            lib_set_name(g, D.edit_tmp);
+            D.edit_key = NULL;
+            SDL_StopTextInput(SDL_GetKeyboardFocus());
+        } else {
+            D.edit_key = k_rename;
+            snprintf(D.edit_tmp, sizeof(D.edit_tmp), "%s", g->g.title);
+            SDL_StartTextInput(SDL_GetKeyboardFocus());
+        }
+    }
+    if (editing) {
+        if (D.in.text && strlen(D.edit_tmp) + strlen(D.in.text) < sizeof(D.edit_tmp)) {
+            strcat(D.edit_tmp, D.in.text);
+        }
+        if (D.in.key == SDLK_BACKSPACE && D.edit_tmp[0]) {
+            size_t n = strlen(D.edit_tmp);
+            do {
+                n--;                        /* a whole UTF-8 character */
+            } while (n > 0 && ((unsigned char)D.edit_tmp[n] & 0xC0) == 0x80);
+            D.edit_tmp[n] = 0;
+            D.in.back = false;
+        }
+        if (D.in.key == SDLK_ESCAPE || !list_selected(l)) {
+            D.edit_key = NULL;
+            SDL_StopTextInput(SDL_GetKeyboardFocus());
+            D.in.back = false;
+        }
+    }
+}
+
 static void scr_game(void)
 {
     LibGame *g = D.cur;
@@ -1312,7 +1382,32 @@ static void scr_game(void)
     if (list_row(&l, T(S_DOWNLOAD_COVER), NULL, NULL)) {
         lib_fetch_cover(g);
     }
+    if (list_row(&l, T(S_CHOOSE_COVER), NULL, NULL)) {
+        static const SDL_DialogFileFilter f[] = {{"Images (*.png, *.jpg)", "png;jpg;jpeg"}};
+        SDL_ShowOpenFileDialog(cover_file_cb, NULL, SDL_GetKeyboardFocus(), f, 1, NULL, false);
+    }
+    rename_row(&l, g);
+    if (list_row(&l, T(S_SHORTCUT), NULL, NULL)) {
+        char png[1200], ico[1200], where[1200];
+        const bool icon = lib_icon_files(g, png, sizeof(png), ico, sizeof(ico));
+        dash_toast(sc_make(g->g.title, g->g.path, icon ? png : NULL, icon ? ico : NULL, where, sizeof(where))
+                       ? T(S_SHORTCUT_DONE) : T(S_SHORTCUT_FAIL));
+    }
+    if (list_row(&l, T(g->hidden ? S_UNHIDE_GAME : S_HIDE_GAME), NULL, NULL)) {
+        lib_set_hidden(g, !g->hidden);
+        if (g->hidden && !cfg_bool(&D.global, "ui.showhidden", false)) {
+            dash_pop();     /* gone from the Games screen */
+            return;
+        }
+    }
     list_end(&l);
+    /* a cover image picked (the dialog's callback may run on a thread of its own) */
+    if (SDL_GetAtomicInt(&g_cover_file_set)) {
+        if (!lib_set_cover_file(g, g_cover_file)) {
+            dash_toast(T(S_COVER_BAD));
+        }
+        SDL_SetAtomicInt(&g_cover_file_set, 0);
+    }
     const char *fs = lib_fetch_status();
     if (fs) {
         ui_text(W - 60, 84, fs, 18, UI_FONT_REGULAR, UI_GREEN, UI_ALIGN_RIGHT);
@@ -1572,6 +1667,7 @@ int dash_run(SDL_Window *win, const char *exe)
         ui_backdrop(cfg_bool(&D.global, "ui.anim", true) ? 1.0f : 0.0f);
         /* the screen's foreground in a layer: the transitions turn it in 3D */
         g_layer = ui_layer_begin(g_layer);
+        lib_show_hidden(true);     /* the Games screen leaves hidden games out while it draws */
         switch (dash_top()) {
         case SCR_MAIN: scr_main(); break;
         case SCR_GAMES: scr_games(); break;
@@ -1739,7 +1835,7 @@ static void scr_ingame_slots(void)
         if (has) {
             SDL_DateTime dt;
             SDL_TimeToDateTime(pi.modify_time, &dt, true);
-            snprintf(when, sizeof(when), "%04d-%02d-%02d %02d:%02d", dt.year, dt.month, dt.day, dt.hour, dt.minute);
+            snprintf(when, sizeof(when), "%04d-%02d-%02d %s", dt.year, dt.month, dt.day, dash_hm(dt.hour, dt.minute));
         }
         snprintf(label, sizeof(label), "%s %d", T(S_SLOT), s);
         if (list_row_icon(&l, g_ig_thumb[s], label, has ? when : T(S_EMPTY), NULL, NULL) && (has || g_ig_saving)) {

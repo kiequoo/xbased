@@ -8,7 +8,7 @@ set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 BUILD=${1:-$REPO/../build/linux}
 OUT=${2:-$REPO/../dist}
-VERSION=${3:-1.0.21}
+VERSION=${3:-1.0.22}
 ARCH=${ARCH:-$(uname -m)}
 APPDIR=$OUT/xbased.AppDir
 mkdir -p "$OUT"

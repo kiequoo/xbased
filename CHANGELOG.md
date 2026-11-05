@@ -1,5 +1,31 @@
 # xbased changelog
 
+## 1.0.22 (2026-11)
+
+### New
+- CHD disc images (`chdman createdvd`, from an XISO or a full dump): in the
+  library and on the command line, like an ISO, read through libchdr.
+- Desktop shortcuts (a game's page › Create desktop shortcut): xbased with
+  the game's image as its argument, which boots the game straight away, with
+  the game's own icon. Windows: a shortcut on the desktop; Linux: a desktop
+  entry there and in the applications menu. Steam and other front ends take
+  the same command: `xbased "<image>"`.
+- A game's page: Name (rename it; left empty, the disc's own name again),
+  Choose cover image (a PNG or JPEG of your own as its box art) and Hide
+  game. Settings › Interface › Show hidden games brings them back, dimmed.
+- Settings › Interface › 12-hour clock (the dashboard's clock and the save
+  dates).
+- Downloaded content and title updates copied in by hand
+  (hdd/Partition1/TDATA/<title id>/$c, $u) are signed for this console as
+  the game starts. Signed for another console, or by a tool with another
+  key, a game called them damaged.
+
+### Fixes
+- The frame rate counter wobbled between 58 and 62 at a steady 60: it
+  counted frames in fixed half seconds, where one frame more or less is
+  2 fps. It now measures the time between the frames themselves, over a
+  second.
+
 ## 1.0.21 (2026-11)
 
 ### Fixes

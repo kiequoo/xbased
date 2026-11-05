@@ -413,7 +413,7 @@ void scr_memory_title(void)
         if (e->mtime) {
             SDL_DateTime dt;
             SDL_TimeToDateTime(e->mtime, &dt, true);
-            snprintf(sub, sizeof(sub), "%04d-%02d-%02d %02d:%02d%s", dt.year, dt.month, dt.day, dt.hour, dt.minute,
+            snprintf(sub, sizeof(sub), "%04d-%02d-%02d %s%s", dt.year, dt.month, dt.day, dash_hm(dt.hour, dt.minute),
                      e->exported_only ? "  [exports]" : "");
         }
         size_text(e->bytes, sz, sizeof(sz));

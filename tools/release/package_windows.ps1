@@ -1,7 +1,7 @@
 param(
     [string]$Build = (Join-Path $PSScriptRoot "..\..\..\build\win"),
     [string]$Out = (Join-Path $PSScriptRoot "..\..\..\dist"),
-    [string]$Version = "1.0.21"
+    [string]$Version = "1.0.22"
 )
 # xbased's Windows release: the executable, its fonts and mods, the docs
 # and licenses, in dist\xbased-<version>-windows-x64 and its .zip.

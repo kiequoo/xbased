@@ -11,6 +11,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct XiReport {
     bool ok;
@@ -31,5 +32,12 @@ void xi_start(const char *toml, const char *hdd);
 bool xi_running(void);
 /* The last import's outcome, once (true when there was one to take). */
 bool xi_take_report(XiReport *out);
+
+/* Downloaded content and title updates copied in by hand for a title (any
+ * ContentMeta.xbx under hdd's Partition1/TDATA/<title id>, its $c and $u
+ * folders) signed for this console, as a game started from the dashboard
+ * would find them: signed for another console (or by a tool with another
+ * key), a game called them damaged. Returns how many were re-signed. */
+int xi_resign_downloads(const char *hdd, uint32_t title_id);
 
 #endif

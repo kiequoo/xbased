@@ -62,7 +62,8 @@ static void covers_dir(char *out, size_t n)
 static bool is_image_name(const char *name)
 {
     const char *dot = strrchr(name, '.');
-    return dot && (!SDL_strcasecmp(dot, ".iso") || !SDL_strcasecmp(dot, ".xiso") || !SDL_strcasecmp(dot, ".cci"));
+    return dot && (!SDL_strcasecmp(dot, ".iso") || !SDL_strcasecmp(dot, ".xiso") || !SDL_strcasecmp(dot, ".cci") ||
+                   !SDL_strcasecmp(dot, ".chd"));
 }
 
 /* ------------------------------------------------------------ the cache */
@@ -126,7 +127,7 @@ static void cache_save(void)
     for (int i = 0; i < L.n; i++) {
         const LibGame *g = L.games[i];
         fprintf(f, "%s\t%lld\t%lld\t%08X\t%u\t%u\t%s\n", g->g.path, (long long)g->g.size, (long long)g->mtime,
-                g->g.title_id, g->g.version, g->g.regions, g->g.title);
+                g->g.title_id, g->g.version, g->g.regions, g->orig[0] ? g->orig : g->g.title);
     }
     SDL_UnlockMutex(L.mu);
     fclose(f);
@@ -144,6 +145,113 @@ static void cover_path(const XdGame *g, char *out, size_t n)
     char d[1100];
     covers_dir(d, sizeof(d));
     snprintf(out, n, "%s/%s.png", d, g->key);
+}
+
+/* ------------------------------------------------------------ the user's */
+
+/* custom.txt: a line a game the user changed, its key, 1 if hidden (else
+ * 0), and its name ("" for the disc's) */
+typedef struct {
+    char key[24];
+    bool hidden;
+    char name[128];
+} Custom;
+
+static Custom *g_custom;
+static int g_ncustom;
+static bool g_custom_loaded, g_show_hidden = true;   /* the Games screen sets it while it draws */
+
+static void custom_path(char *out, size_t n)
+{
+    char d[1100];
+    covers_dir(d, sizeof(d));
+    snprintf(out, n, "%s/custom.txt", d);
+}
+
+/* L.mu held */
+static void custom_load(void)
+{
+    if (g_custom_loaded) {
+        return;
+    }
+    g_custom_loaded = true;
+    g_custom = calloc(MAX_GAMES, sizeof(Custom));
+    char p[1200];
+    custom_path(p, sizeof(p));
+    FILE *f = fopen(p, "rb");
+    if (!f || !g_custom) {
+        if (f) {
+            fclose(f);
+        }
+        return;
+    }
+    char line[400];
+    while (g_ncustom < MAX_GAMES && fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *s = line, *key = tok(&s, "\t"), *hid = tok(&s, "\t"), *name = s ? s : "";
+        if (!key || !*key || !hid) {
+            continue;
+        }
+        Custom *c = &g_custom[g_ncustom++];
+        snprintf(c->key, sizeof(c->key), "%s", key);
+        c->hidden = *hid == '1';
+        snprintf(c->name, sizeof(c->name), "%s", name);
+    }
+    fclose(f);
+}
+
+/* L.mu held */
+static void custom_save(void)
+{
+    char p[1200];
+    custom_path(p, sizeof(p));
+    FILE *f = fopen(p, "wb");
+    if (!f) {
+        return;
+    }
+    for (int i = 0; i < g_ncustom; i++) {
+        const Custom *c = &g_custom[i];
+        if (c->hidden || c->name[0]) {
+            fprintf(f, "%s\t%d\t%s\n", c->key, c->hidden ? 1 : 0, c->name);
+        }
+    }
+    fclose(f);
+}
+
+/* L.mu held: the user's for key (made if want) */
+static Custom *custom_of(const char *key, bool want)
+{
+    custom_load();
+    for (int i = 0; i < g_ncustom; i++) {
+        if (!strcmp(g_custom[i].key, key)) {
+            return &g_custom[i];
+        }
+    }
+    if (!want || !g_custom || g_ncustom >= MAX_GAMES) {
+        return NULL;
+    }
+    Custom *c = &g_custom[g_ncustom++];
+    memset(c, 0, sizeof(*c));
+    snprintf(c->key, sizeof(c->key), "%s", key);
+    return c;
+}
+
+/* L.mu held: a game as the user left it */
+static void custom_apply(LibGame *g)
+{
+    const Custom *c = custom_of(g->g.key, false);
+    g->hidden = c && c->hidden;
+    if (c && c->name[0]) {
+        if (!g->orig[0]) {
+            snprintf(g->orig, sizeof(g->orig), "%s", g->g.title);
+        }
+        snprintf(g->g.title, sizeof(g->g.title), "%s", c->name);
+    }
+}
+
+static bool shown(const LibGame *g)
+{
+    return g->g.path[0] && (!g->hidden || g_show_hidden);
 }
 
 /* ------------------------------------------------------------ scanning */
@@ -181,6 +289,7 @@ static void add_game(const char *path, const SDL_PathInfo *pi)
         lg->g.size = (int64_t)pi->size;
     }
     SDL_LockMutex(L.mu);
+    custom_apply(lg);
     /* one entry per game and version: an XISO before a full dump of it */
     for (int i = 0; i < L.n; i++) {
         LibGame *o = L.games[i];
@@ -293,7 +402,7 @@ int lib_count(void)
     SDL_LockMutex(L.mu);
     int k = 0;
     for (int i = 0; i < L.n; i++) {
-        k += L.games[i]->g.path[0] != 0;
+        k += shown(L.games[i]);
     }
     SDL_UnlockMutex(L.mu);
     return k;
@@ -304,7 +413,7 @@ LibGame *lib_get(int idx)
     LibGame *r = NULL;
     SDL_LockMutex(L.mu);
     for (int i = 0, k = 0; i < L.n; i++) {
-        if (L.games[i]->g.path[0] && k++ == idx) {
+        if (shown(L.games[i]) && k++ == idx) {
             r = L.games[i];
             break;
         }
@@ -347,6 +456,99 @@ SDL_Texture *lib_cover(LibGame *g)
         g->cover_tried = true;
     }
     return g->cover_tex;
+}
+
+void lib_set_name(LibGame *g, const char *name)
+{
+    SDL_LockMutex(L.mu);
+    Custom *c = custom_of(g->g.key, true);
+    if (c) {
+        snprintf(c->name, sizeof(c->name), "%s", name ? name : "");
+        if (c->name[0]) {
+            if (!g->orig[0]) {
+                snprintf(g->orig, sizeof(g->orig), "%s", g->g.title);
+            }
+            snprintf(g->g.title, sizeof(g->g.title), "%s", c->name);
+        } else if (g->orig[0]) {
+            snprintf(g->g.title, sizeof(g->g.title), "%s", g->orig);
+            g->orig[0] = 0;
+        }
+        custom_save();
+        qsort(L.games, L.n, sizeof(L.games[0]), cmp_title);
+    }
+    SDL_UnlockMutex(L.mu);
+}
+
+void lib_set_hidden(LibGame *g, bool hidden)
+{
+    SDL_LockMutex(L.mu);
+    Custom *c = custom_of(g->g.key, true);
+    if (c) {
+        c->hidden = hidden;
+        g->hidden = hidden;
+        custom_save();
+    }
+    SDL_UnlockMutex(L.mu);
+}
+
+void lib_show_hidden(bool show)
+{
+    g_show_hidden = show;
+}
+
+bool lib_set_cover_file(LibGame *g, const char *path)
+{
+    int w, h, c;
+    uint8_t *px = stbi_load(path, &w, &h, &c, 4);
+    if (!px) {
+        return false;
+    }
+    char to[1200];
+    cover_path(&g->g, to, sizeof(to));
+    const bool ok = stbi_write_png(to, w, h, 4, px, w * 4) != 0;
+    stbi_image_free(px);
+    if (g->cover_tex) {
+        SDL_DestroyTexture(g->cover_tex);
+        g->cover_tex = NULL;
+    }
+    g->cover_tried = false;
+    return ok;
+}
+
+bool lib_icon_files(const LibGame *g, char *png, size_t pn, char *ico, size_t in)
+{
+    icon_path(&g->g, png, pn);
+    size_t n = 0;
+    uint8_t *d = SDL_LoadFile(png, &n);
+    if (!d || n < 24) {
+        SDL_free(d);
+        return false;
+    }
+    /* an ICO holding the PNG as it is (Windows Vista and later read those) */
+    const uint32_t w = (uint32_t)d[16] << 24 | (uint32_t)d[17] << 16 | (uint32_t)d[18] << 8 | d[19];
+    const uint32_t h = (uint32_t)d[20] << 24 | (uint32_t)d[21] << 16 | (uint32_t)d[22] << 8 | d[23];
+    char dir[1100];
+    covers_dir(dir, sizeof(dir));
+    snprintf(ico, in, "%s/%s.ico", dir, g->g.key);
+    bool ok = SDL_GetPathInfo(ico, NULL);
+    if (!ok) {
+        uint8_t hdr[22] = {0, 0, 1, 0, 1, 0};
+        hdr[6] = w >= 256 ? 0 : (uint8_t)w;
+        hdr[7] = h >= 256 ? 0 : (uint8_t)h;
+        hdr[10] = 1;                        /* planes */
+        hdr[12] = 32;                       /* bits per pixel */
+        for (int i = 0; i < 4; i++) {
+            hdr[14 + i] = (uint8_t)(n >> (8 * i));
+            hdr[18 + i] = (uint8_t)(22u >> (8 * i));
+        }
+        SDL_IOStream *io = SDL_IOFromFile(ico, "wb");
+        ok = io && SDL_WriteIO(io, hdr, sizeof(hdr)) == sizeof(hdr) && SDL_WriteIO(io, d, n) == n;
+        if (io) {
+            SDL_CloseIO(io);
+        }
+    }
+    SDL_free(d);
+    return ok;
 }
 
 /* ------------------------------------------------------------ box art */
@@ -558,7 +760,11 @@ static int fetch_thread(void *arg)
         if (!names_load()) {
             break;
         }
-        const char *nm = best_name(&g->g);
+        XdGame named = g->g;            /* matched by the disc's name, not the user's */
+        if (g->orig[0]) {
+            snprintf(named.title, sizeof(named.title), "%s", g->orig);
+        }
+        const char *nm = best_name(&named);
         if (!nm) {
             continue;
         }

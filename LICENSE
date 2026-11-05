@@ -39,5 +39,5 @@ above:
   FidelityFX Super Resolution 1 (EASU and RCAS), MIT
   (licenses/amd-fsr1.license.txt).
 - The libraries the app bundles (FEX, SDL3, adrenotools, glslang, volk,
-  Vulkan Memory Allocator, SPIRV-Reflect, nv2a_vsh_cpu, and FEX's own
+  Vulkan Memory Allocator, SPIRV-Reflect, nv2a_vsh_cpu, libchdr (BSD-3), and FEX's own
   dependencies): their licenses are in licenses/.

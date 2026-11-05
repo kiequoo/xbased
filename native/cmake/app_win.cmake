@@ -19,12 +19,14 @@ set(NC_APP_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/dash_memory.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/xemu_import.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/update.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/shortcut.c"
 )
 if(WIN32)
   enable_language(RC)
   add_executable(hakux WIN32 ${NC_APP_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/app/win/xbased.rc")
   # the linker's map: the profile's offsets resolved where there is no debug info (HAKUX_PROF)
   target_link_options(hakux PRIVATE "-Wl,-Map=$<TARGET_FILE_DIR:hakux>/xbased.map")
+  target_link_libraries(hakux PRIVATE ole32 uuid shell32)   # the desktop shortcuts (app/ui/shortcut.c)
 else()
   add_executable(hakux ${NC_APP_SOURCES})
 endif()

@@ -33,6 +33,7 @@
 #include "native/app/ui/input_map.h"
 #include "hw/xbox/hle/vk/swapchain.h"
 #include "native/app/ui/xbox_data.h"
+#include "native/app/ui/xemu_import.h"
 #include "native/app/win_auto.h"
 #include "native/app/win_mods.h"
 #include "native/core/cheats.h"
@@ -83,6 +84,7 @@ static int g_nargs;
 static int g_ncfg_args;            /* how many of them xbased.ini gave */
 static ImMap g_map;     /* the controls: the game's file over xbased.ini (input_map.h) */
 static char g_key[24];  /* the game's "<TITLE ID>.<version>" */
+static uint32_t g_title_id;  /* ... its title id */
 
 /* ------------------------------------------------------------ helpers */
 
@@ -201,6 +203,7 @@ static void game_options(const char *disc)
         nc_log("hakuX-app", "%d options of the game's (%s)", c.n, path);
     }
     snprintf(g_key, sizeof(g_key), "%s", g.key);
+    g_title_id = g.title_id;
     Config global;
     snprintf(path, sizeof(path), "%sxbased.ini", g_data_dir);
     cfg_load(&global, path);
@@ -741,7 +744,7 @@ static const char *pick_disc(void)
 }
 
 #ifndef XBASED_VERSION
-#define XBASED_VERSION "1.0.21"
+#define XBASED_VERSION "1.0.22"
 #endif
 #ifdef _WIN32
 #define NC_PLATFORM_NAME "Windows"
@@ -829,6 +832,13 @@ int main(int argc, char *argv[])
         snprintf(hdd, sizeof(hdd), "%shdd", g_data_dir);
     }
     make_hdd(hdd);
+    if (g_title_id) {
+        /* downloaded content and title updates copied in by hand: signed for this console */
+        const int resigned = xi_resign_downloads(hdd, g_title_id);
+        if (resigned) {
+            nc_log("hakuX-app", "%d downloaded content file(s) of %08x re-signed for this console", resigned, g_title_id);
+        }
+    }
     nc_io_set_hdd_root(hdd);
     setenv("HAKUX_HLE_MODE", "replace", 0);
     {

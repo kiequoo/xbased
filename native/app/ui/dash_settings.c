@@ -116,7 +116,7 @@ static void SDLCALL add_file_cb(void *ud, const char *const *files, int filter)
 void dash_pick_game_file(void)
 {
     static const SDL_DialogFileFilter f[] = {
-        {"Xbox disc images (*.iso, *.xiso, *.cci)", "iso;xiso;cci"},
+        {"Xbox disc images (*.iso, *.xiso, *.cci, *.chd)", "iso;xiso;cci;chd"},
         {"All files", "*"},
     };
     SDL_ShowOpenFileDialog(add_file_cb, NULL, SDL_GetKeyboardFocus(), f, 2, NULL, false);
@@ -216,6 +216,8 @@ void scr_settings(void)
         opt_bool(&l, S_UI_SOUNDS, "ui.sounds", true, false);
         opt_bool(&l, S_CHECK_UPDATES, "update.check", true, false);
         opt_bool(&l, S_SWAP_AB, "ui.swapab", false, false);
+        opt_bool(&l, S_SHOW_HIDDEN, "ui.showhidden", false, false);
+        opt_bool(&l, S_CLOCK_12H, "ui.clock12", false, false);
         const char *dirs[16];
         const int nd = cfg_all(&D.global, "gamedir", dirs, 16);
         for (int i = 0; i < nd; i++) {
@@ -656,7 +658,7 @@ void scr_states(void)
         if (has) {
             SDL_DateTime dt;
             SDL_TimeToDateTime(pi.modify_time, &dt, true);
-            snprintf(when, sizeof(when), "%04d-%02d-%02d %02d:%02d", dt.year, dt.month, dt.day, dt.hour, dt.minute);
+            snprintf(when, sizeof(when), "%04d-%02d-%02d %s", dt.year, dt.month, dt.day, dash_hm(dt.hour, dt.minute));
         }
         snprintf(label, sizeof(label), "%s %d", T(S_SLOT), s);
         if (list_row_icon(&l, g_thumb[s], label, has ? when : T(S_EMPTY), NULL, NULL) && has) {

@@ -3,11 +3,17 @@
  * app's XboxDisc.kt and XprImage.kt read them.
  */
 #include "native/app/ui/xbox_data.h"
+#include "native/core/chd_image.h"
 
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
 
 static uint32_t rd32(const uint8_t *p)
 {
@@ -97,10 +103,14 @@ void xd_clean_name(const char *path, char *out, size_t n)
 typedef struct {
     FILE *f;
     int64_t base;   /* the game partition */
+    int chd;        /* a CHD image: its descriptor (else -1) */
 } Disc;
 
 static bool rd_at(Disc *d, int64_t off, void *buf, size_t n)
 {
+    if (d->chd >= 0) {
+        return nc_chd_read(d->chd, buf, n, (uint64_t)(d->base + off));
+    }
 #ifdef _WIN32
     if (_fseeki64(d->f, d->base + off, SEEK_SET) != 0) {
 #else
@@ -175,17 +185,25 @@ bool xd_read_game(const char *path, XdGame *g)
     memset(g, 0, sizeof(*g));
     snprintf(g->path, sizeof(g->path), "%s", path);
     xd_clean_name(path, g->title, sizeof(g->title));
-    Disc d = {fopen(path, "rb"), 0};
-    if (!d.f) {
+    Disc d = {NULL, 0, open(path, O_RDONLY | O_BINARY)};
+    if (d.chd >= 0 && !nc_chd_attach(d.chd)) {
+        close(d.chd);       /* not a CHD: the file as it is */
+        d.chd = -1;
+    }
+    if (d.chd < 0 && !(d.f = fopen(path, "rb"))) {
         return false;
     }
+    if (d.chd >= 0) {
+        g->size = (int64_t)lseek(d.chd, 0, SEEK_END);
+    } else {
 #ifdef _WIN32
-    _fseeki64(d.f, 0, SEEK_END);
-    g->size = _ftelli64(d.f);
+        _fseeki64(d.f, 0, SEEK_END);
+        g->size = _ftelli64(d.f);
 #else
-    fseeko(d.f, 0, SEEK_END);
-    g->size = ftello(d.f);
+        fseeko(d.f, 0, SEEK_END);
+        g->size = ftello(d.f);
 #endif
+    }
     static const int64_t k_bases[] = {0, 0x18300000, 0xFD90000, 0x2080000, 0x30600000};
     uint8_t vd[0x20];
     bool found = false;
@@ -234,7 +252,12 @@ bool xd_read_game(const char *path, XdGame *g)
         }
     }
     free(x);
-    fclose(d.f);
+    if (d.chd >= 0) {
+        nc_chd_detach(d.chd);
+        close(d.chd);
+    } else {
+        fclose(d.f);
+    }
     snprintf(g->key, sizeof(g->key), "%08X.%u", g->title_id, g->version);
     return ok;
 }

@@ -164,6 +164,21 @@ target_include_directories(hakux_native PRIVATE "${NC_XXHASH_DIR}")
 target_compile_definitions(hakux_native PRIVATE HLE_HOST_TEST)
 target_link_libraries(hakux_native PUBLIC ${NC_CPU_LIB} hakux_hle hakux_apu nc_slirp ${NC_SYS_LIBS} z)
 target_compile_options(hakux_native PRIVATE -Wall -Wno-unused-parameter)
+target_sources(hakux_native PRIVATE core/chd_image.c)
+
+# libchdr (NC_DEPS/libchdr, BSD-3, unmodified): CHD disc images
+# (core/chd_image.c), with its own LZMA, Zstandard and FLAC decoders and the
+# system's zlib. Without it, CHD files aren't read.
+if(EXISTS "${NC_DEPS}/libchdr/CMakeLists.txt")
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(WITH_SYSTEM_ZLIB ON CACHE BOOL "" FORCE)
+  set(CHDR_WANT_TESTS OFF CACHE BOOL "" FORCE)
+  set(INSTALL_STATIC_LIBS OFF CACHE BOOL "" FORCE)
+  add_subdirectory("${NC_DEPS}/libchdr" "${CMAKE_BINARY_DIR}/libchdr" EXCLUDE_FROM_ALL)
+  target_compile_options(chdr-static PRIVATE -w)
+  target_link_libraries(hakux_native PRIVATE chdr-static)
+  target_compile_definitions(hakux_native PRIVATE NC_HAVE_CHD)
+endif()
 
 # xboxrun's custom Vulkan driver ("vkdriver="): the app's code for it
 # (native/app/vkdriver.c, vklayer.c), through adrenotools when NC_DEPS has it

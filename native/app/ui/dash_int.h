@@ -70,6 +70,8 @@ void dash_push(enum Screen s);
 void dash_pop(void);
 enum Screen dash_top(void);
 void dash_toast(const char *msg);
+/* An hour and minute as the user reads clocks (Interface, 12-hour clock). */
+const char *dash_hm(int hour, int minute);
 void dash_ask(const char *question, void (*on_yes)(Dash *));
 /* A question with 2 or 3 answers, the first one selected; the question is
  * copied. */

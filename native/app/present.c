@@ -98,11 +98,19 @@ static void count_frames(void)
         g_last_present_ns = now;
         g_seen_presented = presented;
     }
-    if (now - g_win_start_ns >= 500000000ull) {
+    /* Frames over the time between the first and the last of them seen, a
+     * second or more apart: counted in fixed half seconds, a frame more or
+     * less in one read as 58 or 62 at a steady 60. */
+    if (g_last_present_ns > g_win_start_ns && g_last_present_ns - g_win_start_ns >= 1000000000ull) {
         const uint64_t n = presented - g_win_presented;
-        const float ms = (float)(now - g_win_start_ns) / 1e6f;
+        const float ms = (float)(g_last_present_ns - g_win_start_ns) / 1e6f;
         g_fps = (float)n * 1000.0f / ms;
         g_avg_ms = n ? ms / (float)n : 0.0f;
+        g_win_start_ns = g_last_present_ns;
+        g_win_presented = presented;
+    } else if (now - g_win_start_ns >= 2000000000ull) {
+        g_fps = 0.0f;                       /* nothing shown for a while */
+        g_avg_ms = 0.0f;
         g_win_start_ns = now;
         g_win_presented = presented;
     }
