@@ -39,4 +39,5 @@ target_compile_options(hakux PRIVATE -Wall -Wno-unused-parameter -Wno-unused-fun
 # dashboard's fonts, beside the executable
 add_custom_command(TARGET hakux POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${NC_REPO}/mods" "$<TARGET_FILE_DIR:hakux>/mods"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${NC_REPO}/cheats" "$<TARGET_FILE_DIR:hakux>/cheats"
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/fonts" "$<TARGET_FILE_DIR:hakux>/fonts")

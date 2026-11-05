@@ -78,6 +78,29 @@ author: someone
   `tools/mods/` holds the generators (`doa2_120fps.py` writes
   `54430006.6/120fps/mod.txt` from the game's XBE).
 
+## The widescreen database (`widescreen.dat`)
+
+OgXHD's widescreen database (from icup321's XboxGraphicalPatches): a title
+ID line (`:4d530051`), then pairs of lines, the bytes to find in the game's
+`default.xbe` and the bytes that replace them. A game in it gets a
+**Widescreen 16:9 (database)** entry; switched on, each pair is searched for
+in the executable's sections and written where it's found, its old bytes
+checked. A release the patterns don't fit gets nothing (the log says how
+many matched).
+
+## Xbox scene cheat files (`cheats/<TITLE ID>/*.etm`, `*.xbtf`)
+
+The cheat files EvolutionX, Avalaunch and XBMC4Xbox ran (known there as
+trainers): x86 code for up to three title IDs with a list of options, run
+once before the game's entry point. xbased ships a collection in `cheats/`
+beside the executable, by title ID; your own go in `cheats/<TITLE ID>/` in
+the data folder. Each option is a `[cheat]` entry in Mods & patches; the
+game's settings keep them as `xcheat=cheats/<TITLE ID>/<file>|<states>`
+(one `1` or `0` an option). Many check the executable's timestamp first: a
+file made for another release does nothing. `.xbtf` files get the helper
+routines XBMC4Xbox loads for them (the code patch, the hook, the in-game
+key toggles). On the command line: `xcheat=<file>|<states>`.
+
 ## Cheats (`cheats.txt`)
 
 ```

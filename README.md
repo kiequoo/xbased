@@ -63,8 +63,8 @@ the emulator, the dashboard, the game fixes and every release.
 
 | Platform | File | |
 |---|---|---|
-| **Windows** 10/11 (x64) | `xbased-1.0.22-windows-x64.zip` | Unzip anywhere and run `xbased.exe`. Portable: everything stays in its folder. |
-| **Linux** (x86-64) | `xbased-1.0.22-x86_64.AppImage` | `chmod +x` it and run. Ubuntu 22.04 or newer, or any distribution of the same age. |
+| **Windows** 10/11 (x64) | `xbased-1.0.28-windows-x64.zip` | Unzip anywhere and run `xbased.exe`. Portable: everything stays in its folder. |
+| **Linux** (x86-64) | `xbased-1.0.28-x86_64.AppImage` | `chmod +x` it and run. Ubuntu 22.04 or newer, or any distribution of the same age. |
 
 Get them from **[Releases](https://github.com/crazyriddler/xbased/releases/latest)**.
 
@@ -121,7 +121,12 @@ xbased doesn't include any copyrighted Xbox software.
 
 ### Patches & mods
 - **Per-game patches**: 60/120 fps, widescreen, fixes and cheats, toggled per
-  game.
+  game. Over 160 widescreen, 60 fps and 480p patches ship with it, plus a
+  widescreen database for 90 games that finds its patterns in your disc's
+  executable.
+- **Cheats for 500 games**: the Xbox scene's cheat files (.etm, .xbtf)
+  come with xbased and their options show up in each game's Mods & patches.
+  Add your own to `cheats/<TITLE ID>/`.
 - **Frame rate per game**: Original, up to 60, up to 120 or unlocked, where
   the game allows it (anything but Original can break a game).
 - **Downloaded content and title updates** copied into
@@ -315,6 +320,29 @@ More options (link-time optimization, the dependencies' location) are in
   project. Interface font: Play (SIL Open Font License).
 - SDL3, Zydis, libslirp, libchdr, xxHash, volk, Vulkan Memory Allocator, glslang,
   SPIRV-Reflect and the other components listed in [LICENSE](LICENSE).
+
+## Thanks
+
+xbased's cheat and patch database is the work of the Xbox community, and
+it's here thanks to them:
+
+- **The cheat makers of the Xbox scene**: xboxtrainers.net, Team Evox-T,
+  Team Xored, Angelfly, k_away, Hitman, RoBoZeO, Falcon3, Thatguy, Xor and
+  everyone else who made the .etm and .xbtf cheat files EvolutionX,
+  Avalaunch and XBMC4Xbox ran (known there as trainers). The files come from
+  the [Xbox Original ETM Trainers](https://archive.org/details/ETMTrainers)
+  collection on the Internet Archive.
+- **[XBMC4Xbox](https://github.com/Rocky5/XBMC4Xbox)** and Team Xored, whose
+  trainer loader showed how those files run (xbased loads the same helper
+  routines for .xbtf files).
+- **[icup321](https://github.com/icup321/XboxGraphicalPatches)** and
+  **[Slippy2k](https://github.com/Slippy2k/XboxGraphicalPatches)** for their
+  widescreen, 60 fps and 480p patches, and the **OgXHD** widescreen
+  database that comes with them.
+- **[xemu](https://xemu.app)** and its [xdb](https://github.com/xemu-project/xdb)
+  title database, which matched every patch to its game.
+- Everyone who reports issues, tests games and shares saves and logs: that's
+  how the games on the list got fixed.
 
 ## License
 

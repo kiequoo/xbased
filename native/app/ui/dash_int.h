@@ -124,6 +124,10 @@ void scr_states(void);
 /* the folder picker's answer: a game folder added (SDL_ShowOpenFolderDialog) */
 void add_folder_cb(void *ud, const char *const *files, int filter);
 void dash_take_folder(void);
+/* a game file started without adding it to the library: a dialog for one,
+ * or one given (dropped on the window) */
+void dash_pick_play_file(void);
+void dash_play_file_later(const char *path);
 void dash_pick_game_file(void);  /* a disc image the folders don't have, added on its own */    /* each frame: a folder picked meanwhile goes in */
 
 /* the game's files */

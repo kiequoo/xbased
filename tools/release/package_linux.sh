@@ -8,7 +8,7 @@ set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 BUILD=${1:-$REPO/../build/linux}
 OUT=${2:-$REPO/../dist}
-VERSION=${3:-1.0.22}
+VERSION=${3:-1.0.28}
 ARCH=${ARCH:-$(uname -m)}
 APPDIR=$OUT/xbased.AppDir
 mkdir -p "$OUT"
@@ -21,6 +21,7 @@ install -m 755 "$BUILD/xbased" "$APPDIR/usr/bin/xbased"
 strip --strip-debug "$APPDIR/usr/bin/xbased" 2>/dev/null || true
 cp -r "$REPO/native/app/ui/fonts" "$APPDIR/usr/bin/fonts"
 cp -r "$REPO/mods" "$APPDIR/usr/bin/mods"
+cp -r "$REPO/cheats" "$APPDIR/usr/bin/cheats"
 mv "$APPDIR/usr/bin/mods/README.md" "$APPDIR/usr/share/doc/xbased/MODS.md"   # how to add patches
 README=$REPO/docs/xbased/README.md; [ -f "$README" ] || README=$REPO/README.md
 cp "$README" "$REPO/COPYING" "$REPO/LICENSE" "$APPDIR/usr/share/doc/xbased/"

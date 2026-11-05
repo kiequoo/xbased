@@ -71,18 +71,17 @@ hrtf_filter_set_target_params(HrtfFilter *f, float hrir_coeff[2][HRTF_NUM_TAPS],
     f->itd_tar =
         fmaxf(-HRTF_MAX_DELAY_SAMPLES, fminf(itd, HRTF_MAX_DELAY_SAMPLES));
 
+    /* The taps as the hardware weighs them: a half each (eight fractional
+     * bits, not seven). DirectSound's frontal HRIR then passes speech at
+     * about unity (0.75-1.0 from 500 Hz to 8 kHz) with the HRTF headroom
+     * games set, 0. Each channel was divided by the sum of its taps'
+     * sizes instead (6.1 for the frontal one): 3D voices came out 8-10 dB
+     * under the 2D ones, the dialogue of Halo and others too quiet. */
     for (int ch = 0; ch < 2; ch++) {
         const float *coeff = hrir_coeff[ch];
-
-        // Normalize coefficients for unity filter gain (each channel's own)
-        float s = 0.0f;
-        for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-            s += fabsf(coeff[k]);
-        }
-        const bool norm = !(s == 0.0f || s == 1.0f);
         float *tar = f->ch[ch].hrir_coeff_tar;
         for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-            tar[HRTF_NUM_TAPS - 1 - k] = norm ? coeff[k] / s : coeff[k];
+            tar[HRTF_NUM_TAPS - 1 - k] = coeff[k] * 0.5f;
         }
         tar[HRTF_NUM_TAPS] = 0.0f;
     }

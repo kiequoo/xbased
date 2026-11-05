@@ -1,5 +1,79 @@
 # xbased changelog
 
+## 1.0.28 (2026-11)
+
+### Changes
+- 1.0.27's change for Prince of Persia: The Two Thrones on AMD graphics
+  cards is taken back. It wasn't tested on AMD hardware and it isn't what
+  draws the blocks, so images read before anything wrote them behave as in
+  1.0.26 again. The blocks are still being looked into.
+
+## 1.0.27 (2026-11)
+
+### Fixes
+- Prince of Persia: The Two Thrones on AMD graphics cards: the screen
+  filled with blocks of other images over the menus and the game. Its glow
+  shrinks the frame through targets down to 10x7 and samples them before
+  all of them are drawn; an image read before anything wrote it held the
+  memory's leftovers, which NVIDIA's drivers clear and AMD's don't. Such an
+  image now reads as zeros (a depth buffer as its far plane) on every GPU.
+
+## 1.0.26 (2026-11)
+
+### New
+- Console memory, 64 MB (retail) or 128 MB (debug kit), for all games or
+  one (Settings › System, or a game's settings): betas, demos and debug
+  builds made for a debug kit's 128 MB (StarCraft: Ghost's beta, Halo 2's
+  E3 2003 demo and others) get it. A game marked for 64 MB keeps 64, as a
+  debug kit runs it (given 128, a retail Halo drew nothing). The GPU
+  reports the memory as well. On the command line: `ram=128`.
+- Play a game file without adding it to the library: Settings › Interface
+  › Play a game file, or drop the disc image on xbased's window.
+
+## 1.0.25 (2026-11)
+
+### Fixes
+- 3D sound (Halo, Grand Theft Auto San Andreas and every game with
+  positional effects and voices): muffled, smeared and too quiet. The
+  console's HRTF filters, the head-related responses DirectSound loads
+  for 3D voices, come as sign-and-magnitude bytes; they were read as two's
+  complement, so a small negative tap (0x81, -1) became -127 and each
+  response turned to noise across its 31 taps. Each was then divided by
+  the sum of its taps' sizes, which left 3D voices 8 to 10 dB under the
+  rest of the mix (dialogue among them). The taps are read as the
+  hardware reads them and weighed as it does: the frontal response passes
+  speech at about unity, and the sides show the head's shadow and the
+  ear's resonance as they should. Savestates from before are converted as
+  they load.
+
+## 1.0.24 (2026-11)
+
+### New
+- A game with a frame rate patch of its own (60 or 120 fps, in Mods &
+  patches) says so when the frame rate is unlocked: the patch is made for
+  the game and keeps its speed right, where lifting the console's pace can
+  break it. The frame rate option's help says so too.
+
+## 1.0.23 (2026-11)
+
+### New
+- Cheats for 500 games: the Xbox scene's cheat files (.etm and .xbtf,
+  the ones EvolutionX, Avalaunch and XBMC4Xbox ran as trainers) ship in
+  `cheats/`, about a thousand of them, by title ID. A game's Mods & patches
+  lists each file's options as `[cheat]` entries; switched on, the file's
+  code runs once before the game's entry point and patches it, as the
+  console's loader ran it. `.xbtf` files get the helper routines XBMC4Xbox
+  loads for them. Your own files go in `cheats/<TITLE ID>/`.
+- Over 160 widescreen, 60 fps and 480p patches ship in `mods/<TITLE ID>/`
+  (icup321's and Slippy2k's XboxGraphicalPatches, matched to their games
+  through xemu's title database; the 720p ones, which their authors call
+  unstable, left out). They were made for the USA releases: a patch made for
+  another release of a game can break it.
+- Widescreen 16:9 (database) for 90 games: OgXHD's widescreen patterns,
+  searched for in the disc's executable and written where they're found
+  (their old bytes checked), so they hold across releases where the code is
+  the same and do nothing where it isn't.
+
 ## 1.0.22 (2026-11)
 
 ### New

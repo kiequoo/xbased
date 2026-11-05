@@ -19,7 +19,7 @@
 #endif
 
 #ifndef XBASED_VERSION
-#define XBASED_VERSION "1.0.22"
+#define XBASED_VERSION "1.0.28"
 #endif
 
 Dash D;
@@ -282,6 +282,11 @@ static void poll_input(void)
             }
             break;
         }
+        case SDL_EVENT_DROP_FILE:
+            /* a disc image dropped on the window: played once, not added */
+            dash_play_file_later(e.drop.data);
+
+            break;
         case SDL_EVENT_TEXT_INPUT:
             in->text = e.text.text;
             break;

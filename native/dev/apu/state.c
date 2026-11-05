@@ -127,6 +127,7 @@ static const ApuField k_apu_fields[] = {
      * the title didn't commit again was silent after a load
      * (mcpx_apu_vp_restore_hrtf) */
     OPT_DATA(MCPXAPUState, vp.hrtf),
+    OPT_DATA(MCPXAPUState, vp.hrir_sm),
     END,
 };
 static const ApuDesc k_apu = {"mcpx-apu", k_apu_fields};

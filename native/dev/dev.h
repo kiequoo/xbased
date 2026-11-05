@@ -12,6 +12,8 @@ extern "C" {
 
 /* NV2A register space at 0xFD000000 and its vblank clock. */
 void nc_dev_nv2a_init(void);
+/* the RAM size the GPU reports (PFB_CSTATUS: 64 or 128 MiB) */
+void nc_dev_nv2a_set_ram(uint32_t bytes);
 uint64_t nc_dev_nv2a_vblanks(void);
 /* The video mode's refresh rate (50 or 60 Hz): the vblank clock's. */
 void nc_dev_nv2a_refresh(unsigned hz);

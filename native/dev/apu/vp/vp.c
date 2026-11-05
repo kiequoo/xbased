@@ -518,11 +518,20 @@ static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
     return (apu_ld(&d->vp.voice_locked[v / 64]) & mask) != 0;
 }
 
+/* An HRIR tap: sign and magnitude (bit 7 the sign, bits 0-6 the size), not
+ * two's complement. Read as two's complement, a small negative tap (0x81,
+ * -1) became -127: DirectSound's HRIRs, smooth decaying responses, turned
+ * to noise across all 31 taps, and every 3D voice through them (Halo's,
+ * San Andreas' effects and voices) came out muffled and wrong. Read so,
+ * they show the head's shadow and the pinna's peak an HRIR has. */
 static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
                                int8_t value)
 {
     int entry = d->vp.hrtf.current_entry;
-    d->vp.hrtf.entries[entry].hrir[channel][coeff_idx] = int8_to_float(value);
+    const uint8_t b = (uint8_t)value;
+    const int mag = b & 0x7F;
+    d->vp.hrtf.entries[entry].hrir[channel][coeff_idx] = (float)(b & 0x80 ? -mag : mag) / 128.0f;
+    d->vp.hrir_sm = 1;
 }
 
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
@@ -2680,6 +2689,7 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
 {
     d->vp.ssl_base_page = 0;
     d->vp.hrtf_headroom = 0;
+    d->vp.hrir_sm = 0;
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
     memset(d->vp.submix_headroom, 0, sizeof(d->vp.submix_headroom));
@@ -2701,6 +2711,21 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
  * voice whose parameters the title doesn't commit again was silent. */
 void mcpx_apu_vp_restore_hrtf(MCPXAPUState *d)
 {
+    /* a savestate from before the taps were read as sign and magnitude:
+     * each tap's byte again (two's complement, x 128), read so */
+    if (!d->vp.hrir_sm) {
+        for (unsigned e = 0; e < HRTF_ENTRY_COUNT; e++) {
+            for (int ch = 0; ch < 2; ch++) {
+                for (int k = 0; k < HRTF_NUM_TAPS; k++) {
+                    float *t = &d->vp.hrtf.entries[e].hrir[ch][k];
+                    const uint8_t b = (uint8_t)(int8_t)lrintf(*t * 128.0f);
+                    const int mag = b & 0x7F;
+                    *t = (float)(b & 0x80 ? -mag : mag) / 128.0f;
+                }
+            }
+        }
+        d->vp.hrir_sm = 1;
+    }
     if (!d->regs[NV_PAPU_VPVADDR]) {
         return;
     }

@@ -744,7 +744,7 @@ static const char *pick_disc(void)
 }
 
 #ifndef XBASED_VERSION
-#define XBASED_VERSION "1.0.22"
+#define XBASED_VERSION "1.0.28"
 #endif
 #ifdef _WIN32
 #define NC_PLATFORM_NAME "Windows"
@@ -852,6 +852,25 @@ int main(int argc, char *argv[])
     nc_options_init(&opt);
     for (int i = 0; i < g_nargs; i++) {
         const char *a = g_args[i];
+        char resolved[2400];
+        if (!strncmp(a, "xcheat=", 7) && a[7] && a[7] != '/' && a[7] != '\\' && a[8] != ':') {
+            /* a cheat file under cheats/ (the shipped ones beside the
+             * executable, the user's in the data folder) */
+            char p[1300];
+            snprintf(p, sizeof(p), "%s", a + 7);
+            char *bar = strrchr(p, '|');
+            const char *states = bar ? bar + 1 : "";
+            if (bar) {
+                *bar = 0;
+            }
+            char full[1400];
+            snprintf(full, sizeof(full), "%s%s", g_data_dir, p);
+            if (access(full, 0) != 0) {
+                snprintf(full, sizeof(full), "%s%s", g_exe_dir, p);
+            }
+            snprintf(resolved, sizeof(resolved), "xcheat=%s|%s", full, states);
+            a = resolved;
+        }
         if (nc_option(&opt, a)) {
             continue; /* the core's */
         }

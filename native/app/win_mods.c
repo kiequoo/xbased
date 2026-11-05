@@ -299,6 +299,145 @@ static int ips_patches(FILE *out, int disc_fd, const char *path, const char *id,
     return recs;
 }
 
+/* default.xbe whole from the disc (*len bytes), NULL if it can't be read */
+static uint8_t *read_xbe(int disc_fd, uint32_t *len)
+{
+    const int fd = dup(disc_fd);
+    NcDisc d;
+    memset(&d, 0, sizeof(d));
+    uint8_t *x = NULL;
+    if (fd >= 0 && nc_disc_open(&d, fd)) {
+        NcDiscFile f;
+        if (nc_disc_find(&d, "default.xbe", &f) && f.size >= 0x1000 && f.size < (64u << 20)) {
+            x = malloc(f.size);
+            if (x && !nc_disc_read(&d, &f, 0, x, f.size)) {
+                free(x);
+                x = NULL;
+            }
+            *len = f.size;
+        }
+        nc_disc_close(&d);
+    } else if (fd >= 0) {
+        close(fd);
+    }
+    return x && !memcmp(x, "XBEH", 4) ? x : (free(x), NULL);
+}
+
+/* OgXHD's widescreen database (mods/widescreen.dat, icup321's
+ * XboxGraphicalPatches): ":<title id>" then pairs of lines, the bytes to
+ * find in the game's XBE and what replaces them; "'" a comment. Each pair's
+ * hex strings for title_id into find/repl, NULL when the title has none. */
+typedef struct {
+    int n;
+    uint8_t find[64][96], repl[64][96];
+    int len[64];
+} WsPatch;
+
+static int hexbytes(const char *s, uint8_t *out, int max)
+{
+    int n = 0;
+    for (; isxdigit((unsigned char)s[0]) && isxdigit((unsigned char)s[1]) && n < max; s += 2) {
+        char b[3] = {s[0], s[1], 0};
+        out[n++] = (uint8_t)strtoul(b, NULL, 16);
+    }
+    return n;
+}
+
+static bool widescreen_db(const char *exe_dir, uint32_t title_id, WsPatch *w)
+{
+    char path[MAX_PATH * 2];
+    snprintf(path, sizeof(path), "%smods/widescreen.dat", exe_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    char want[16];
+    snprintf(want, sizeof(want), ":%08x", title_id);
+    char line[512], prev[512] = "";
+    bool in = false;
+    memset(w, 0, sizeof(*w));
+    while (fgets(line, sizeof(line), f)) {
+        char *s = trim(line);
+        if (!s[0] || s[0] == '\'') {
+            continue;
+        }
+        if (s[0] == ':') {
+            if (in) {
+                break;
+            }
+            in = !strcasecmp(s, want);
+            prev[0] = 0;
+            continue;
+        }
+        if (!in) {
+            continue;
+        }
+        if (!prev[0]) {
+            snprintf(prev, sizeof(prev), "%s", s);
+            continue;
+        }
+        if (w->n < 64) {
+            const int a = hexbytes(prev, w->find[w->n], 96), b = hexbytes(s, w->repl[w->n], 96);
+            if (a && a == b) {
+                w->len[w->n++] = a;
+            }
+        }
+        prev[0] = 0;
+    }
+    fclose(f);
+    return w->n > 0;
+}
+
+/* The database's patches for this disc as the manifest's lines, each match
+ * of a pair's bytes in a section of default.xbe written with its old bytes
+ * checked (old -> new): the patterns are found, not placed, so a release the
+ * database wasn't made from gets them only where they are. */
+static int widescreen_patches(FILE *out, int disc_fd, const WsPatch *w, const char *id, bool on)
+{
+    uint32_t len = 0;
+    uint8_t *x = read_xbe(disc_fd, &len);
+    if (!x) {
+        return 0;
+    }
+    uint32_t base, nsec, secs;
+    memcpy(&base, x + 0x104, 4);
+    memcpy(&nsec, x + 0x11C, 4);
+    memcpy(&secs, x + 0x120, 4);
+    secs -= base;
+    int hits = 0;
+    for (uint32_t k = 0; k < nsec && k < 256 && secs + (k + 1) * 0x38 <= len; k++) {
+        const uint8_t *sh = x + secs + k * 0x38;
+        uint32_t sva, raw, rsize;
+        memcpy(&sva, sh + 4, 4);
+        memcpy(&raw, sh + 0xC, 4);
+        memcpy(&rsize, sh + 0x10, 4);
+        if (raw >= len || rsize > len - raw) {
+            continue;
+        }
+        for (int p = 0; p < w->n; p++) {
+            for (uint32_t o = raw; o + (uint32_t)w->len[p] <= raw + rsize; o++) {
+                if (x[o] != w->find[p][0] || memcmp(x + o, w->find[p], (size_t)w->len[p])) {
+                    continue;
+                }
+                char line[96 * 6 + 32];
+                int n = snprintf(line, sizeof(line), "0x%08X:", sva + (o - raw));
+                for (int i = 0; i < w->len[p]; i++) {
+                    n += snprintf(line + n, sizeof(line) - (size_t)n, " %02X", w->find[p][i]);
+                }
+                n += snprintf(line + n, sizeof(line) - (size_t)n, " ->");
+                for (int i = 0; i < w->len[p]; i++) {
+                    n += snprintf(line + n, sizeof(line) - (size_t)n, " %02X", w->repl[p][i]);
+                }
+                fprintf(out, "%s\tdefault.xbe\t%s\t%s\n", on ? "patch" : "patchoff", id, line);
+                hits++;
+                o += (uint32_t)w->len[p] - 1;
+            }
+        }
+    }
+    free(x);
+    return hits;
+}
+
 bool nc_win_mods_prepare(const char *exe_dir, int disc_fd, char **opts, int nopts)
 {
     char key[32];
@@ -319,7 +458,10 @@ bool nc_win_mods_prepare(const char *exe_dir, int disc_fd, char **opts, int nopt
         }
         scan_mods(dirs[d], mods, &n);
     }
-    if (!n && GetFileAttributesA(dirs[0]) == INVALID_FILE_ATTRIBUTES) {
+    /* the widescreen database's patches for the title (a mod of its own) */
+    static WsPatch ws;
+    const bool have_ws = widescreen_db(exe_dir, (uint32_t)strtoul(key, NULL, 16), &ws);
+    if (!n && !have_ws && GetFileAttributesA(dirs[0]) == INVALID_FILE_ATTRIBUTES) {
         nc_log("hakuX-mods", "%s: no mods or cheats", key);
         return false;
     }
@@ -389,6 +531,13 @@ bool nc_win_mods_prepare(const char *exe_dir, int disc_fd, char **opts, int nopt
         }
         nc_log("hakuX-mods", "%s mod %s (\"%s\"): %s", key, mods[i].id, mods[i].name,
                mods[i].on ? "on" : "off (mod=<its folder> turns it on)");
+    }
+    if (have_ws) {
+        const bool won = opt_has(opts, nopts, "mod", "widescreen-db");
+        const int hits = widescreen_patches(out, disc_fd, &ws, "widescreen-db", won);
+        on += won;
+        nc_log("hakuX-mods", "%s widescreen database: %d of its %d patterns' matches in default.xbe: %s", key, hits,
+               ws.n, won ? "on" : "off (mod=widescreen-db turns it on)");
     }
     if (refresh > 0) {
         fprintf(out, "refresh\t%d\n", refresh);

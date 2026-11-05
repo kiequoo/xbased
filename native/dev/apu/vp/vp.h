@@ -106,6 +106,10 @@ typedef struct {
     MCPXAPUVPSSLData ssl[MCPX_HW_MAX_VOICES];
     uint8_t hrtf_headroom;
     uint8_t hrtf_submix[4];
+    /* the HRTF entries read as sign and magnitude (set_hrir_coeff_tar); 0
+     * in a savestate from before, its taps two's complement (converted
+     * as it loads: mcpx_apu_vp_restore_hrtf) */
+    uint8_t hrir_sm;
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];
     uint64_t voice_locked[4];

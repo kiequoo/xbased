@@ -6,6 +6,8 @@
  *                    vblank (the HLE GPU's HAKUX_HLE_UNCAP)
  *   fpscap=N         uncapped, at most N frames a second (60, 120: the
  *                    HLE GPU's HAKUX_HLE_FPSCAP; 0 or absent, no limit)
+ *   xcheat=FILE|ON  a cheat file (.etm, .xbtf: core/xcheat.h) run before the
+ *                    title, its options on as the 1s and 0s say
  *   relaunch         a title's reboot into another of its XBEs
  *   loadstate=FILE   boot into a savestate (native/state)
  *   mods=FILE        the run's mods and cheats (native/core/mods.h)

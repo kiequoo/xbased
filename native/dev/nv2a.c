@@ -851,6 +851,13 @@ static void *vblank_thread(void *arg)
     return NULL;
 }
 
+void nc_dev_nv2a_set_ram(uint32_t bytes)
+{
+    if (g_regs) {
+        nc_wr32(g_regs + NV_PFB_CSTATUS, bytes);
+    }
+}
+
 void nc_dev_nv2a_init(void)
 {
     g_regs = calloc(1, NV2A_SIZE); /* pages are touched only where the guest writes */

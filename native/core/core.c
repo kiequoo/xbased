@@ -7,10 +7,12 @@
 #include "native/hle/hle_native.h"
 #include "native/core/mmio.h"
 #include "native/core/mods.h"
+#include "native/core/xcheat.h"
 #include "native/net/net.h"
 #include "native/state/save.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #include <strings.h>
 #include <sys/prctl.h>
@@ -103,9 +105,30 @@ bool nc_core_boot(NcCore *c, int disc_fd)
 {
     memset(c, 0, sizeof(*c));
     c->disc.fd = -1;
-    /* NC_RAM_MB=128 (debug kit size): a dev switch for memory investigations. */
+    /* 128 MiB, a debug kit's (the option ram=128, NC_RAM_MB=128): for a title
+     * built without XINIT_LIMIT_DEVKIT_MEMORY (the XBE's init flag 4), as a
+     * debug kit gives it; betas and debug builds use the extra memory. A
+     * retail title marked for 64 MiB gets 64 there too: given 128, Halo's
+     * D3D wrote push buffer jumps the GPU can't take and drew nothing. */
     const char *mb = getenv("NC_RAM_MB");
-    const uint32_t ram = mb && atoi(mb) == 128 ? 128u << 20 : NC_RAM_RETAIL;
+    uint32_t ram = mb && atoi(mb) == 128 ? 128u << 20 : NC_RAM_RETAIL;
+    if (ram > NC_RAM_RETAIL && disc_fd >= 0) {
+        NcDisc d;
+        memset(&d, 0, sizeof(d));
+        const int fd = dup(disc_fd);
+        NcDiscFile f;
+        uint8_t h[0x128];
+        if (fd >= 0 && nc_disc_open(&d, fd)) {
+            if (nc_disc_find(&d, "default.xbe", &f) && nc_disc_read(&d, &f, 0, h, sizeof(h)) &&
+                !memcmp(h, "XBEH", 4) && (nc_rd32(h + 0x124) & 4)) {
+                ram = NC_RAM_RETAIL;
+                nc_log("hakuX-native", "memory: the title is marked for 64 MiB (as a debug kit runs it): 64 MiB");
+            }
+            nc_disc_close(&d);
+        } else if (fd >= 0) {
+            close(fd);
+        }
+    }
     /* a savestate's kernel objects are where its boot made them (KERN v3
      * moved the pool's first range) */
     nc_kernel_pool_for(g_loadstate[0] ? nc_kern_state_kprocess(g_loadstate) : 0);
@@ -117,6 +140,7 @@ bool nc_core_boot(NcCore *c, int disc_fd)
         nc_kernel_av_saved_set(nc_mm_keep_restore(&c->kernel));
     }
     nc_dev_nv2a_init();
+    nc_dev_nv2a_set_ram(c->vm.ram_size);   /* PFB_CSTATUS: the memory the GPU reports */
     nc_dev_apu_init(&c->vm); /* before the catch-all, which would claim its window */
     nc_dev_ohci_init(&c->vm);
     nc_dev_aci_init(&c->vm);
@@ -222,7 +246,10 @@ bool nc_core_boot(NcCore *c, int disc_fd)
     if (c->xbe.stack_commit > stack) {
         stack = nc_align_up(c->xbe.stack_commit, NC_PAGE);
     }
-    g_boot = nc_kernel_boot_thread(&c->kernel, c->cpu, c->xbe.info.entry, stack);
+    /* a cheat file chosen for this title (core/xcheat.c): run before the entry point */
+    const uint32_t start = g_loadstate[0] ? c->xbe.info.entry
+                                          : nc_xcheat_install(&c->kernel, &c->vm, c->xbe.info.entry, c->xbe.info.title_id);
+    g_boot = nc_kernel_boot_thread(&c->kernel, c->cpu, start, stack);
     if (!g_boot) {
         return boot_failed("The emulated CPU couldn't start.");
     }

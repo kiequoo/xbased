@@ -1,7 +1,7 @@
 param(
     [string]$Build = (Join-Path $PSScriptRoot "..\..\..\build\win"),
     [string]$Out = (Join-Path $PSScriptRoot "..\..\..\dist"),
-    [string]$Version = "1.0.22"
+    [string]$Version = "1.0.28"
 )
 # xbased's Windows release: the executable, its fonts and mods, the docs
 # and licenses, in dist\xbased-<version>-windows-x64 and its .zip.
@@ -14,6 +14,7 @@ New-Item -ItemType Directory -Force $dst | Out-Null
 Copy-Item (Join-Path $Build "xbased.exe") $dst
 Copy-Item -Recurse (Join-Path $repo "native\app\ui\fonts") (Join-Path $dst "fonts")
 Copy-Item -Recurse (Join-Path $repo "mods") (Join-Path $dst "mods")
+Copy-Item -Recurse (Join-Path $repo "cheats") (Join-Path $dst "cheats")   # the Xbox scene's cheat files, by title ID
 Move-Item (Join-Path $dst "mods\README.md") (Join-Path $dst "MODS.md") -Force   # how to add patches
 $readme = Join-Path $repo "docs\xbased\README.md"
 if (-not (Test-Path $readme)) { $readme = Join-Path $repo "README.md" }
