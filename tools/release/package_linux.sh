@@ -1,13 +1,15 @@
 #!/bin/bash
 # xbased's Linux release: an AppImage of the executable, its fonts and mods,
-# the docs and licenses, in dist/xbased-<version>-x86_64.AppImage.
+# the docs and licenses, in dist/xbased-<version>-<arch>.AppImage.
 #   tools/release/package_linux.sh [build dir] [out dir] [version]
+# The arch is the host's (uname -m: x86_64 or aarch64), or override with $ARCH.
 # appimagetool is fetched once into the out dir (or taken from $APPIMAGETOOL).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 BUILD=${1:-$REPO/../build/linux}
 OUT=${2:-$REPO/../dist}
 VERSION=${3:-1.0.21}
+ARCH=${ARCH:-$(uname -m)}
 APPDIR=$OUT/xbased.AppDir
 mkdir -p "$OUT"
 rm -rf "$APPDIR"
@@ -50,17 +52,17 @@ exec "$HERE/usr/bin/xbased" "$@"
 EOF
 chmod 755 "$APPDIR/AppRun"
 
-TOOL=${APPIMAGETOOL:-$OUT/appimagetool-x86_64.AppImage}
+TOOL=${APPIMAGETOOL:-$OUT/appimagetool-$ARCH.AppImage}
 if [ ! -x "$TOOL" ]; then
-  curl -fL -o "$TOOL" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+  curl -fL -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
   chmod 755 "$TOOL"
 fi
-RUNTIME=${APPIMAGE_RUNTIME:-$OUT/runtime-x86_64}
+RUNTIME=${APPIMAGE_RUNTIME:-$OUT/runtime-$ARCH}
 if [ ! -s "$RUNTIME" ]; then
-  curl -fL -o "$RUNTIME" https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+  curl -fL -o "$RUNTIME" "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-$ARCH"
 fi
-IMG=$OUT/xbased-$VERSION-x86_64.AppImage
+IMG=$OUT/xbased-$VERSION-$ARCH.AppImage
 rm -f "$IMG"
 # extract-and-run: no FUSE needed where it's built
-ARCH=x86_64 "$TOOL" --appimage-extract-and-run --no-appstream --runtime-file "$RUNTIME" "$APPDIR" "$IMG"
+ARCH=$ARCH "$TOOL" --appimage-extract-and-run --no-appstream --runtime-file "$RUNTIME" "$APPDIR" "$IMG"
 ls -la "$IMG"

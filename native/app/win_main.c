@@ -904,7 +904,9 @@ int main(int argc, char *argv[])
     }
     nc_vsync_start();
     nc_auto_init(g_data_dir, save_state, load_state);
+#if defined(__x86_64__) || (defined(__aarch64__) && defined(__linux__))
     nc_core_fault_install(&g_core);
+#endif
     pads_changed();
 
     pthread_attr_t attr;
@@ -958,12 +960,51 @@ int main(int argc, char *argv[])
                 }
                 break;
             case SDL_EVENT_GAMEPAD_BUTTON_DOWN: {
-                /* the menu: the Guide button, or Back with Start */
                 SDL_Gamepad *gp = SDL_GetGamepadFromID(ev.gbutton.which);
-                if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE ||
-                    (gp && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK) &&
-                     SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_START))) {
+                if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE) {
                     ingame_menu(win, &paused, minimized);
+                    break;
+                }
+                /* EmuDeck-style combos: Select (Back) held + a second button */
+                if (gp && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK)) {
+                    switch (ev.gbutton.button) {
+                    case SDL_GAMEPAD_BUTTON_START:           /* Select+Start  -> quit */
+                        nc_log("xbased", "quit to the dashboard");
+                        _exit(0);
+                    case SDL_GAMEPAD_BUTTON_RIGHT_STICK:     /* Select+R3     -> menu */
+                        ingame_menu(win, &paused, minimized);
+                        break;
+                    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:  /* Select+R1     -> save state */
+                        save_state(1);
+                        break;
+                    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:   /* Select+L1     -> load state */
+                        load_state(1);
+                        break;
+                    case SDL_GAMEPAD_BUTTON_NORTH:           /* Select+Y      -> screenshot */
+                        screenshot();
+                        break;
+                    case SDL_GAMEPAD_BUTTON_LEFT_STICK:      /* Select+L3     -> pause */
+                        paused = !paused;
+                        nc_kernel_set_paused(&g_core.kernel, paused || minimized);
+                        nc_audio_set_paused(paused || minimized);
+                        nc_log("xbased", "%s", paused ? "paused" : "resumed");
+                        break;
+                    default: break;
+                    }
+                }
+                break;
+            }
+            case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+                /* Select+R2 (right trigger) -> fast-forward while held */
+                if (ev.gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) {
+                    SDL_Gamepad *gp = SDL_GetGamepadFromID(ev.gaxis.which);
+                    bool want = gp && SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_BACK) &&
+                                ev.gaxis.value > 16384;  /* ~half pull */
+                    static bool pad_turbo;
+                    if (want != pad_turbo) {
+                        pad_turbo = want;
+                        nc_win_prop_set("debug.hakux.uncap", pad_turbo ? "1" : (g_uncap ? "1" : "0"));
+                    }
                 }
                 break;
             }

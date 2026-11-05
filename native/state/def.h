@@ -35,9 +35,10 @@
  * sizes from the assembly instead) */
 #ifdef NC_STATE_PROBE
 #define NC_REC(T, size) const unsigned long nc_probe_size_##T = sizeof(T);
-#elif defined(_WIN32)
-/* Windows' host types (its pthread mutexes, NC_SKIP members) have other
- * sizes: the sizes are Android's; the members are still checked below. */
+#elif defined(_WIN32) || defined(__aarch64__)
+/* Windows and arm64 Linux host types (pthread mutexes) differ in size from
+ * the Android/x86-64 baseline the .def sizes were measured on; skip the whole-
+ * struct check — field-level checks (NC_F/NC_SKIP) still run below. */
 #define NC_REC(T, size)
 #else
 #define NC_REC(T, size)                                                                            \

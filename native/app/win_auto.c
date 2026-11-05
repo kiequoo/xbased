@@ -77,7 +77,9 @@ static void act(const char *a, const char *label)
     }
     if (!_strnicmp(a, "prof ", 5)) {
         nc_log("hakuX-auto", "%.1f s: profile for %s s", now_s() - g_auto.t0, a + 5);
+#if defined(__x86_64__)
         nc_cpu_prof_start((unsigned)atoi(a + 5));
+#endif
         return;
     }
     if (!_strnicmp(a, "save ", 5) || !_strnicmp(a, "load ", 5)) {
