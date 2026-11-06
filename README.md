@@ -63,8 +63,8 @@ the emulator, the dashboard, the game fixes and every release.
 
 | Platform | File | |
 |---|---|---|
-| **Windows** 10/11 (x64) | `xbased-1.0.29-windows-x64.zip` | Unzip anywhere and run `xbased.exe`. Portable: everything stays in its folder. |
-| **Linux** (x86-64) | `xbased-1.0.29-x86_64.AppImage` | `chmod +x` it and run. Ubuntu 22.04 or newer, or any distribution of the same age. |
+| **Windows** 10/11 (x64) | `xbased-1.0.36-windows-x64.zip` | Unzip anywhere and run `xbased.exe`. Portable: everything stays in its folder. |
+| **Linux** (x86-64) | `xbased-1.0.36-x86_64.AppImage` | `chmod +x` it and run. Ubuntu 22.04 or newer, or any distribution of the same age. |
 
 Get them from **[Releases](https://github.com/crazyriddler/xbased/releases/latest)**.
 
@@ -341,6 +341,11 @@ it's here thanks to them:
   database that comes with them.
 - **[xemu](https://xemu.app)** and its [xdb](https://github.com/xemu-project/xdb)
   title database, which matched every patch to its game.
+- **[raddad772](https://github.com/raddad772)**, whose measurements of the
+  audio chip on a retail console (xemu pull request
+  [#3105](https://github.com/xemu-project/xemu/pull/3105)) the sound
+  emulation follows: the HRTF taps and routing, the filters, the resampler,
+  the volume curve, envelopes, LFOs and ramps.
 - Everyone who reports issues, tests games and shares saves and logs: that's
   how the games on the list got fixed.
 

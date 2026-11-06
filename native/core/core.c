@@ -217,7 +217,7 @@ bool nc_core_boot(NcCore *c, int disc_fd)
                                "the hard disk's C: drive.");
         }
         const char *name = strrchr(xbe_path, '\\');
-        snprintf(why, sizeof(why), "The game's program (%s) can't be loaded: it's damaged, or hakuX doesn't support "
+        snprintf(why, sizeof(why), "The game's program (%s) can't be loaded: it's damaged, or xbased doesn't support "
                  "it yet.", name ? name + 1 : xbe_path);
         return boot_failed(why);
     }

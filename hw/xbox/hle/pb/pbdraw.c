@@ -2078,6 +2078,12 @@ static uint32_t object_at(uint32_t pa)
     return best ? best->id : 0;
 }
 
+uint32_t hle_pbd_target_rows(uint32_t pa, uint32_t pitch)
+{
+    const PbObj *o = g_pd.on && g_pd.device ? obj_of(object_at(pa)) : NULL;
+    return o && pitch && o->d.pitch == pitch && !o->d.parent ? o->d.h : 0;
+}
+
 /* A colour target whose memory is exactly face f of a cube (w x w texels
  * of bytes each at pa + f * stride): swizzled, or linear rows of w. */
 static bool face_target(const PbObj *o, uint32_t pa, uint32_t w, uint32_t bytes)

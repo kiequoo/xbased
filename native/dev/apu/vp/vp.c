@@ -30,9 +30,10 @@
  * Measures how much per-voice decode/resample/SVF/mix work voice_process()
  * spends on voices that are ACTIVE (fully processed) but MATHEMATICALLY
  * SILENT: envelope amplitude ea_value == 0 AND all 8 mixbin volumes fully
- * attenuated (vol & 0xFFF == 0xFFF, i.e. attenuate() == 0 exactly). The
- * per-bin mix contribution is ea_value * attenuate(vol[b]), so both-zero
- * implies the voice emits silence this frame.
+ * attenuated (vol & 0xFFF == 0xFFF, a route's gain 0 exactly). The
+ * per-route gain is the envelope's level times the attenuation's, so
+ * both-zero implies the voice emits silence this frame (but for the ramp
+ * down from its last frame's gains, voice_process).
  *
  * This probe changes NO control flow and skips NO work — it only reads
  * already-computed locals (ea_value, vol[]) and increments relaxed-atomic
@@ -144,40 +145,110 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
     apu_st(&d->set_irq, true);
 }
 
+/* A voice's processing state as a new voice's (VOICE_ON): filters and
+ * resampler empty, its first frame fading in from silence at its own pitch,
+ * frequencies and HRTF entry, its LFOs taking their delays again. */
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
-    if (d->vp.filters[v].resampler) {
-        src_reset(d->vp.filters[v].resampler);
-    }
+    MCPXAPUVoiceFilter *vf = &d->vp.filters[v];
+    memset(vf->svf, 0, sizeof(vf->svf));
+    memset(vf->peq, 0, sizeof(vf->peq));
+    memset(vf->i3dl2, 0, sizeof(vf->i3dl2));
+    memset(vf->interp, 0, sizeof(vf->interp));
+    vf->interp_idx = 0;
+    /* five input samples read before the first output, so the voice's first
+     * sample is the interpolator's centre (interp[3]) */
+    vf->interp_pos = 5 << 16;
+    vf->resample_buf_pos = NUM_SAMPLES_PER_FRAME;
+    memset(vf->route_gain, 0, sizeof(vf->route_gain));
+    vf->gains = false;
+    vf->pitched = false;
+    vf->dls2_set = false;
+    vf->peq_set = false;
+    memset(vf->lfo_phase, 0, sizeof(vf->lfo_phase));
+    memset(vf->lfo_wait, 0, sizeof(vf->lfo_wait));
+    vf->lfo_armed = false;
+    vf->hrtf.params_set = false;
+    hrtf_filter_clear_history(&vf->hrtf);
 }
 
-static float clampf(float v, float min, float max)
+/* Filter coefficients take 2^(x / 4096) to a 1024th of an octave, then to
+ * the nearest 1/65536, at most FFFFh (measured: D97Eh gave 3043h, which
+ * reproduces all 32 samples of the ParaEQ's response there where the exact
+ * exponential missed 30; FC0 0 passed 1 - 2^-15 of an impulse on the first
+ * sample, so f is FFFFh / 65536, not 1). g_octave_frac holds the 1024
+ * steps of an octave, 2^(j / 1024) * 65536. */
+static double g_octave_frac[1024];
+
+static void filter_coefficient_init(void)
 {
-    if (v < min) {
-        return min;
-    } else if (v > max) {
-        return max;
-    } else {
-        return v;
+    for (int j = 0; j < 1024; j++) {
+        g_octave_frac[j] = exp2(j / 1024.0) * 65536.0;
     }
 }
 
-/* attenuate()'s values for the 4096 volumes, computed once (the same
- * expression: a voice asks for 16 a frame) */
-static float g_attenuation[0x1000];
+static float filter_coefficient(double x)
+{
+    int k = (int)floor(x / 4.0);
+    int octave = (int)floor(k / 1024.0);
+    double c = ldexp(g_octave_frac[k - octave * 1024], octave);
+    return fmin(round(c), 65535.0) / 65536.0;
+}
+
+/* Route gains in 1/16384, attenuations in 1/64 dB (measured): straight lines
+ * between whole decibels through round(4095 * 10^(-k / 20)), rounded down;
+ * from 48 dB a straight line to nothing at 63 dB, so FC0h and above are
+ * silent. Attenuation 0 is unity. A retail console's gains at 37
+ * attenuations from 001h to FFDh match this to the 1/16384: F00h gave
+ * 12/16384, F80h 4 and FB0h 1, where 10^(-att / 1280) gives 16, 13 and 12. */
+static uint32_t attenuation_nodes[64];
 
 static void attenuation_init(void)
 {
-    for (int vol = 0; vol < 0x1000; vol++) {
-        g_attenuation[vol] = (vol == 0xFFF) ? 0.0 : powf(10.0f, vol/(64.0 * -20.0f));
+    for (int k = 0; k <= 48; k++) {
+        attenuation_nodes[k] = floor(4095.0 * pow(10.0, -k / 20.0) + 0.5);
+    }
+    for (int k = 49; k < 64; k++) {
+        attenuation_nodes[k] = attenuation_nodes[48] * (63 - k) / 15;
     }
 }
 
-static float attenuate(uint16_t vol)
+static uint32_t attenuation_gain(int att)
 {
-    return g_attenuation[vol & 0xFFF];
+    if (att <= 0) {
+        return 16384;
+    }
+    if (att >= 63 * 64) {
+        return 0;
+    }
+    uint32_t n0 = attenuation_nodes[att >> 6];
+    uint32_t n1 = attenuation_nodes[(att >> 6) + 1];
+    return (256 * n0 - 4 * (n0 - n1) * (att & 63)) >> 6;
+}
+
+/* Hardware resamples with 8-point Lagrange interpolation, each weight rounded
+ * to 1/65536. A retail console's response to an impulse at half a sample
+ * (pitch -1000h) is exactly that kernel's, 1225, -245, 49 and -5 / 2048 on
+ * each side, and its responses at each eighth of a sample match the weights
+ * rounded to 1/65536 to the bit. Between 256ths of a sample the weights are
+ * interpolated (assumed). Row r holds the weights of input samples -3..4
+ * around the cursor at r / 256 of a sample past sample 0. */
+static float lagrange_rows[257][8];
+
+static void lagrange_init(void)
+{
+    for (int r = 0; r <= 256; r++) {
+        for (int k = -3; k <= 4; k++) {
+            double w = 1.0;
+            for (int j = -3; j <= 4; j++) {
+                if (j != k) {
+                    w *= (r / 256.0 - j) / (k - j);
+                }
+            }
+            lagrange_rows[r][k + 3] = round(w * 65536.0) / 65536.0;
+        }
+    }
 }
 
 /* A table's pointer from the guest's base: NULL with no base yet or without
@@ -253,9 +324,9 @@ static inline uint32_t voice_get_mask_nolock(MCPXAPUState *d, uint8_t *c,
 }
 
 #if HAKUX_AUDIO_SKIP_MUTED
-/* True iff this voice contributes ZERO to every mixbin THIS frame, i.e. all 8
- * mixbin volumes are 0xFFF so attenuate(vol[i])==0 for every bin (see
- * attenuate(): returns exactly 0.0 iff vol&0xFFF==0xFFF). This is the hoisted
+/* True iff every route's target gain is ZERO THIS frame, i.e. all 8 mixbin
+ * volumes are 0xFFF (silent even under the amplitude LFO; voice_process also
+ * needs the last frame's gains at zero, as they ramp). This is the hoisted
  * form of the vol[] reads at the bottom of voice_process (the VOLA/VOLB/VOLC
  * packing, including the split vol[6]/vol[7] nibble assembly): it MUST stay
  * bit-identical to those reads. Read here BEFORE the resample block so the
@@ -292,7 +363,7 @@ static inline bool voice_all_vols_maxed(MCPXAPUState *d, uint8_t *c,
                              NV_PAVS_VOICE_TAR_VOLA_VOLUME7_B3_0);
 
     for (int i = 0; i < 8; i++) {
-        if ((vol[i] & 0xFFF) != 0xFFF) { /* attenuate(vol[i]) != 0 -> audible */
+        if ((vol[i] & 0xFFF) != 0xFFF) { /* the route is audible */
             return false;
         }
     }
@@ -518,20 +589,27 @@ static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
     return (apu_ld(&d->vp.voice_locked[v / 64]) & mask) != 0;
 }
 
-/* An HRIR tap: sign and magnitude (bit 7 the sign, bits 0-6 the size), not
- * two's complement. Read as two's complement, a small negative tap (0x81,
- * -1) became -127: DirectSound's HRIRs, smooth decaying responses, turned
- * to noise across all 31 taps, and every 3D voice through them (Halo's,
- * San Andreas' effects and voices) came out muffled and wrong. Read so,
- * they show the head's shadow and the pinna's peak an HRIR has. */
+/* An HRIR tap is a sign-magnitude minifloat: bit 7 the sign, a 3-bit
+ * exponent and a 4-bit mantissa, (16 + m) * 2^(e - 1) / 2048, or m / 2048
+ * when the exponent is 0, from 1/2048 to 31/32. Measured on a retail console
+ * with DC through single taps: 01h gave 1/2048, 20h 1/64, 40h 1/16 and 7Fh
+ * 31/32, 81h and C0h the negatives of 01h and 40h. Read as two's complement
+ * / 128, 40h was 0.5, eight times too loud, and small negative taps (81h)
+ * became -127/128, which turned DirectSound's HRIRs to noise. */
+static float hrir_tap_to_float(uint8_t tap)
+{
+    int e = (tap >> 4) & 7;
+    int m = tap & 15;
+    float v = (e ? (16 + m) << (e - 1) : m) / 2048.0f;
+    return (tap & 0x80) ? -v : v;
+}
+
 static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
-                               int8_t value)
+                               uint8_t value)
 {
     int entry = d->vp.hrtf.current_entry;
-    const uint8_t b = (uint8_t)value;
-    const int mag = b & 0x7F;
-    d->vp.hrtf.entries[entry].hrir[channel][coeff_idx] = (float)(b & 0x80 ? -mag : mag) / 128.0f;
-    d->vp.hrir_sm = 1;
+    d->vp.hrtf.entries[entry].hrir[channel][coeff_idx] = hrir_tap_to_float(value);
+    d->vp.hrir_sm = 2;
 }
 
 static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
@@ -609,7 +687,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                                NV_PAVS_VOICE_CFG_ENV0_EA_DELAYTIME);
             voice_set_mask(d, selected_handle, NV_PAVS_VOICE_CUR_ECNT,
                            NV_PAVS_VOICE_CUR_ECNT_EACOUNT, delay_time * 16);
-        } else if (ea_start == NV_PAVS_VOICE_PAR_STATE_EFCUR_ATTACK) {
+        } else if (ea_start == NV_PAVS_VOICE_PAR_STATE_EFCUR_ATTACK ||
+                   ea_start == NV_PAVS_VOICE_PAR_STATE_EFCUR_DECAY) {
+            /* attack and decay count up from zero when a voice starts in
+             * them (measured) */
             voice_set_mask(d, selected_handle, NV_PAVS_VOICE_CUR_ECNT,
                            NV_PAVS_VOICE_CUR_ECNT_EACOUNT, 0);
         } else if (ea_start == NV_PAVS_VOICE_PAR_STATE_EFCUR_HOLD) {
@@ -630,7 +711,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
                                NV_PAVS_VOICE_CFG_ENV0_EA_DELAYTIME);
             voice_set_mask(d, selected_handle, NV_PAVS_VOICE_CUR_ECNT,
                            NV_PAVS_VOICE_CUR_ECNT_EFCOUNT, delay_time * 16);
-        } else if (ef_start == NV_PAVS_VOICE_PAR_STATE_EFCUR_ATTACK) {
+        } else if (ef_start == NV_PAVS_VOICE_PAR_STATE_EFCUR_ATTACK ||
+                   ef_start == NV_PAVS_VOICE_PAR_STATE_EFCUR_DECAY) {
             voice_set_mask(d, selected_handle, NV_PAVS_VOICE_CUR_ECNT,
                            NV_PAVS_VOICE_CUR_ECNT_EFCOUNT, 0);
         } else if (ef_start == NV_PAVS_VOICE_PAR_STATE_EFCUR_HOLD) {
@@ -723,18 +805,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
     case NV1BA0_PIO_SET_VOICE_TAR_HRTF: {
         unsigned int handle = GET_MASK(argument, NV1BA0_PIO_SET_VOICE_TAR_HRTF_HANDLE);
         uint32_t current_voice = d->regs[NV_PAPU_FECV];
+        /* the voice reads its entry each frame (voice_process), so a new
+         * handle or a rewritten entry takes effect on the next frame */
         voice_set_mask(d, current_voice, NV_PAVS_VOICE_CFG_HRTF_TARGET,
                        NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE, handle);
-        if (current_voice < MCPX_HW_MAX_3D_VOICES &&
-            handle != HRTF_NULL_HANDLE &&
-            APU_CHECK(handle < HRTF_ENTRY_COUNT)) {
-            // FIXME: Xbox software seems to reliably set voice HRTF handles
-            // after updating filter parameters, however it may be possible to
-            // update parameter targets for an active voice.
-            hrtf_filter_set_target_params(&d->vp.filters[current_voice].hrtf,
-                                          d->vp.hrtf.entries[handle].hrir,
-                                          d->vp.hrtf.entries[handle].itd);
-        }
         break;
     }
     case NV1BA0_PIO_SET_VOICE_TAR_VOLA:
@@ -749,8 +823,19 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         voice_set_mask(d, d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_TAR_VOLC,
                        0xFFFFFFFF, argument);
         break;
+    /* DirectSound's SetLFO writes the delays (50h) and depths (70h) with
+     * methods 350h and 370h: like the other voice methods, the record offset
+     * plus 300h */
+    case NV1BA0_PIO_SET_VOICE_LFO_DELAY:
+        voice_set_mask(d, d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_PAR_LFO_DELAY,
+                       0xFFFFFFFF, argument);
+        break;
     case NV1BA0_PIO_SET_VOICE_LFO_ENV:
         voice_set_mask(d, d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_TAR_LFO_ENV,
+                       0xFFFFFFFF, argument);
+        break;
+    case NV1BA0_PIO_SET_VOICE_LFO_MOD:
+        voice_set_mask(d, d->regs[NV_PAPU_FECV], NV_PAVS_VOICE_TAR_LFO_MOD,
                        0xFFFFFFFF, argument);
         break;
     case NV1BA0_PIO_SET_VOICE_TAR_FCA:
@@ -787,10 +872,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             break;
         }
         slot = (method - NV1BA0_PIO_SET_HRIR) / 4;
-        int8_t left0 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_LEFT0);
-        int8_t right0 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_RIGHT0);
-        int8_t left1 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_LEFT1);
-        int8_t right1 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_RIGHT1);
+        uint8_t left0 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_LEFT0);
+        uint8_t right0 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_RIGHT0);
+        uint8_t left1 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_LEFT1);
+        uint8_t right1 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_RIGHT1);
         int coeff_idx = slot * 2;
         set_hrir_coeff_tar(d, 0, coeff_idx, left0);
         set_hrir_coeff_tar(d, 1, coeff_idx, right0);
@@ -803,8 +888,8 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
         if (!APU_CHECK((unsigned)d->vp.hrtf.current_entry < HRTF_ENTRY_COUNT)) {
             break;
         }
-        int8_t left30 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_X_LEFT30);
-        int8_t right30 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_X_RIGHT30);
+        uint8_t left30 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_X_LEFT30);
+        uint8_t right30 = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_X_RIGHT30);
         int16_t itd = GET_MASK(argument, NV1BA0_PIO_SET_HRIR_X_ITD);
         set_hrir_coeff_tar(d, 0, 30, left30);
         set_hrir_coeff_tar(d, 1, 30, right30);
@@ -848,17 +933,15 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             argument & NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_HANDLE;
         break;
     case NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET: {
-        // FIXME: Is there an upper limit for the SGE table size?
-        // FIXME: NV_PAPU_VPSGEADDR is probably bad, as inbuf SGE use the same
-        // handle range (or that is also wrong)
+        /* Output buffer SGEs are not stored in the voices' input SGE table:
+         * on a retail console a voice whose samples are in input SGE entry 0
+         * kept playing them after the GP's output buffer SGEs 0 and 1 were
+         * set, as DirectSound and the kernel do when they start the GP.
+         * Written there, the entry took the GP FIFO's page and the voice
+         * played silence. Output buffers are not emulated, so the pages are
+         * not kept. */
         // NV_PAPU_EPFADDR   EP outbufs
         // NV_PAPU_GPFADDR   GP outbufs
-        // But how does it know which outbuf is being written?!
-        uint64_t sge_address =
-            d->regs[NV_PAPU_VPSGEADDR] + d->vp.outbuf_sge_handle * 8;
-        apu_ram_st32(sge_address,
-                    argument &
-                        NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
         DPRINTF("Wrote outbuf SGE[0x%X] = 0x%08X\n", d->vp.outbuf_sge_handle,
                 argument & NV1BA0_PIO_SET_CURRENT_OUTBUF_SGE_OFFSET_PARAMETER);
         break;
@@ -944,6 +1027,10 @@ static void fe_method(MCPXAPUState *d, uint32_t method, uint32_t argument)
             DPRINTF("idle voice %d\n", argument);
             apu_st(&d->set_irq, true);
         } else {
+            /* Without the forced trap an idle voice is skipped: on hardware
+             * an inactive voice can stay in a list with FETFORCE1's
+             * SE2FE_IDLE_VOICE clear, and the rest of the list keeps
+             * mixing. */
             DPRINTF("ignoring idle voice %d without FETFORCE1 request\n",
                     argument);
         }
@@ -1018,7 +1105,9 @@ void mcpx_apu_vp_write(void *opaque, uint32_t addr, uint64_t val, unsigned int s
     case NV1BA0_PIO_SET_VOICE_TAR_VOLA:
     case NV1BA0_PIO_SET_VOICE_TAR_VOLB:
     case NV1BA0_PIO_SET_VOICE_TAR_VOLC:
+    case NV1BA0_PIO_SET_VOICE_LFO_DELAY:
     case NV1BA0_PIO_SET_VOICE_LFO_ENV:
+    case NV1BA0_PIO_SET_VOICE_LFO_MOD:
     case NV1BA0_PIO_SET_VOICE_TAR_FCA:
     case NV1BA0_PIO_SET_VOICE_TAR_FCB:
     case NV1BA0_PIO_SET_VOICE_TAR_PITCH:
@@ -1118,6 +1207,25 @@ static uint64_t get_data_ptr(MCPXAPUState *d, uint64_t sge_base,
     return prd_address + addr % APU_PAGE_SIZE;
 }
 
+static float envelope_level(MCPXAPUState *d, uint8_t *c, uint16_t v,
+                            uint32_t lvl_reg, uint32_t lvl_mask, double units)
+{
+    voice_set_mask_nolock(d, c, v, lvl_reg, lvl_mask, MIN(255, (int)units / 8));
+    return units / 2048.0;
+}
+
+/* Steps an envelope by one frame and returns its level. Measured on a retail
+ * console with a DC voice read back every frame:
+ * - Each phase steps before its frame plays: attack rate 2 gives 1/32 on its
+ *   first frame and full on its 32nd (2048ths in R * 16 frames). Delay and
+ *   hold last 16T + 1 frames.
+ * - Decay falls by e^(-1/2R) a frame from full to the sustain level, s/255
+ *   (in 2048ths, rounded down). A decay rate of 0 holds one more frame at
+ *   full, then sustains.
+ * - Release holds the level byte, as 256ths, for its first frame, then falls
+ *   by e^(-1/2R) a frame. From 11R frames on it runs down in a straight line
+ *   to nothing at 15R, when the envelope ends.
+ * - The F envelope reads 0 while off; the amplitude envelope reads full. */
 static float voice_step_envelope(MCPXAPUState *d, uint8_t *c, uint16_t v,
                            uint32_t reg_0,
                            uint32_t reg_a, uint32_t rr_reg, uint32_t rr_mask,
@@ -1125,148 +1233,89 @@ static float voice_step_envelope(MCPXAPUState *d, uint8_t *c, uint16_t v,
                            uint32_t count_mask, uint32_t cur_mask)
 {
     uint8_t cur = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask);
+    uint32_t count = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask);
+    uint32_t attack_rate =
+        voice_get_mask_nolock(d, c, v, reg_0, NV_PAVS_VOICE_CFG_ENV0_EA_ATTACKRATE);
+    uint32_t hold_time =
+        voice_get_mask_nolock(d, c, v, reg_a, NV_PAVS_VOICE_CFG_ENVA_EA_HOLDTIME);
+    uint32_t decay_rate =
+        voice_get_mask_nolock(d, c, v, reg_a, NV_PAVS_VOICE_CFG_ENVA_EA_DECAYRATE);
+    uint32_t sustain_level =
+        voice_get_mask_nolock(d, c, v, reg_a, NV_PAVS_VOICE_CFG_ENVA_EA_SUSTAINLEVEL);
+    uint32_t release_rate = voice_get_mask_nolock(d, c, v, rr_reg, rr_mask);
+    double sustain = floor(sustain_level * 2048.0 / 255.0);
+    bool amplitude = count_mask == NV_PAVS_VOICE_CUR_ECNT_EACOUNT;
+
     switch (cur) {
     case NV_PAVS_VOICE_PAR_STATE_EFCUR_OFF:
         voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask, 0);
-        voice_set_mask_nolock(d, c, v, lvl_reg, lvl_mask, 0xFF);
-        return 1.0f;
-    case NV_PAVS_VOICE_PAR_STATE_EFCUR_DELAY: {
-        uint16_t count =
-            voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask);
-        voice_set_mask_nolock(d, c, v, lvl_reg, lvl_mask, 0x00); // FIXME: Confirm this?
-
+        return envelope_level(d, c, v, lvl_reg, lvl_mask, amplitude ? 2048 : 0);
+    case NV_PAVS_VOICE_PAR_STATE_EFCUR_DELAY:
         if (count == 0) {
-            cur++;
-            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur);
-            count = 0;
+            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur + 1);
         } else {
             count--;
         }
         voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask, count);
-        return 0.0f;
-    }
+        return envelope_level(d, c, v, lvl_reg, lvl_mask, 0);
     case NV_PAVS_VOICE_PAR_STATE_EFCUR_ATTACK: {
-        uint16_t count =
-            voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask);
-        uint16_t attack_rate =
-            voice_get_mask_nolock(d, c, v, reg_0, NV_PAVS_VOICE_CFG_ENV0_EA_ATTACKRATE);
-
-        float value;
-        if (attack_rate == 0) {
-            // FIXME: [division by zero]
-            //       Got crackling sound in hardware for amplitude env.
-            value = 255.0f;
-        } else {
-            if (count <= (attack_rate * 16)) {
-                value = (count * 0xFF) / (attack_rate * 16);
-            } else {
-                // FIXME: Overflow in hardware
-                //       The actual value seems to overflow, but not sure how
-                value = 255.0f;
-            }
+        count = MIN(count + 1, 0xFFFF);
+        double units = 2048;
+        if (attack_rate != 0) {
+            units = MIN(2048, floor(2048.0 * count / (attack_rate * 16)));
         }
-        voice_set_mask_nolock(d, c, v, lvl_reg, lvl_mask, value);
-        // FIXME: Comparison could also be the other way around?! Test please.
-        if (count == (attack_rate * 16)) {
-            cur++;
-            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur);
-            uint16_t hold_time =
-                voice_get_mask_nolock(d, c, v, reg_a, NV_PAVS_VOICE_CFG_ENVA_EA_HOLDTIME);
-            count = hold_time * 16; // FIXME: Skip next phase if count is 0?
-                                    // [other instances too]
-        } else {
-            count++;
+        if (attack_rate == 0 || count >= attack_rate * 16) {
+            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur + 1);
+            count = hold_time * 16;
         }
         voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask, count);
-        return value / 255.0f;
+        return envelope_level(d, c, v, lvl_reg, lvl_mask, units);
     }
-    case NV_PAVS_VOICE_PAR_STATE_EFCUR_HOLD: {
-        uint16_t count =
-            voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask);
-        voice_set_mask_nolock(d, c, v, lvl_reg, lvl_mask, 0xFF);
-
+    case NV_PAVS_VOICE_PAR_STATE_EFCUR_HOLD:
         if (count == 0) {
-            cur++;
-            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur);
-            uint16_t decay_rate = voice_get_mask_nolock(
-                d, c, v, reg_a, NV_PAVS_VOICE_CFG_ENVA_EA_DECAYRATE);
-            count = decay_rate * 16;
+            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur + 1);
         } else {
             count--;
         }
         voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask, count);
-        return 1.0f;
-    }
+        return envelope_level(d, c, v, lvl_reg, lvl_mask, 2048);
     case NV_PAVS_VOICE_PAR_STATE_EFCUR_DECAY: {
-        uint16_t count =
-            voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask);
-        uint16_t decay_rate =
-            voice_get_mask_nolock(d, c, v, reg_a, NV_PAVS_VOICE_CFG_ENVA_EA_DECAYRATE);
-        uint8_t sustain_level =
-            voice_get_mask_nolock(d, c, v, reg_a, NV_PAVS_VOICE_CFG_ENVA_EA_SUSTAINLEVEL);
-
-        // FIXME: Decay should return a value no less than sustain
-        float value;
-        if (decay_rate == 0) {
-            value = 0.0f;
-        } else {
-            // FIXME: This formula and threshold is not accurate, but I can't
-            // get it any better for now
-            value = 255.0f * powf(0.99988799f, (decay_rate * 16 - count) *
-                                                   4096 / decay_rate);
+        double units = 2048;
+        if (decay_rate != 0) {
+            count = MIN(count + 1, 0xFFFF);
+            units = floor(2048.0 * exp(-(double)count / (2 * decay_rate)));
         }
-        if (value <= (sustain_level + 0.2f) || (value > 255.0f)) {
-            // FIXME: Should we still update lvl?
-            cur++;
-            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur);
-        } else {
-            count--;
-            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask, count);
-            voice_set_mask_nolock(d, c, v, lvl_reg, lvl_mask, value);
-        }
-        return value / 255.0f;
-    }
-    case NV_PAVS_VOICE_PAR_STATE_EFCUR_SUSTAIN: {
-        uint8_t sustain_level =
-            voice_get_mask_nolock(d, c, v, reg_a, NV_PAVS_VOICE_CFG_ENVA_EA_SUSTAINLEVEL);
-        voice_set_mask_nolock(
-            d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask,
-            0x00); // FIXME: is this only set to 0 once or forced to zero?
-        voice_set_mask_nolock(d, c, v, lvl_reg, lvl_mask, sustain_level);
-        return sustain_level / 255.0f;
-    }
-    case NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE: {
-        uint16_t count =
-            voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask);
-        uint16_t release_rate = voice_get_mask_nolock(d, c, v, rr_reg, rr_mask);
-
-        if (release_rate == 0) {
+        if (decay_rate == 0 || units <= sustain) {
+            units = decay_rate == 0 ? 2048 : sustain;
+            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur + 1);
             count = 0;
         }
-
-        float value = 0;
-        if (count == 0) {
-            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, ++cur);
-        } else {
-            // FIXME: Appears to be an exponential but unsure about actual
-            // curve; performing standard decay of current level to T60 over the
-            // release interval which seems about right.
-            // FIXME: Based on sustain level or just decay of current level?
-            // FIXME: Update level? A very similar, alternative decay function
-            // (probably what the hw actually does): y(t)=2^(-10t), which would
-            // permit simpler attenuation more efficiently and update level on
-            // each round.
-            float pos = clampf(1 - count / (release_rate * 16.0), 0, 1);
-            uint8_t lvl = voice_get_mask_nolock(d, c, v, lvl_reg, lvl_mask);
-            value = powf(M_E, -6.91*pos)*lvl;
-            count--; // FIXME: Should release count ascend or descend?
-            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask, count);
+        voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask, count);
+        return envelope_level(d, c, v, lvl_reg, lvl_mask, units);
+    }
+    case NV_PAVS_VOICE_PAR_STATE_EFCUR_SUSTAIN:
+        voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask, 0);
+        voice_set_mask_nolock(d, c, v, lvl_reg, lvl_mask, sustain_level);
+        return sustain / 2048.0;
+    case NV_PAVS_VOICE_PAR_STATE_EFCUR_RELEASE: {
+        /* The count runs down from R * 16 (VOICE_RELEASE) */
+        uint32_t t = release_rate * 16 > count ? release_rate * 16 - count : 0;
+        if (release_rate == 0 || t >= release_rate * 15) {
+            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE, cur_mask, cur + 1);
+            voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask, 0);
+            return 0.0f;
         }
-
-        return value / 255.0f;
+        voice_set_mask_nolock(d, c, v, NV_PAVS_VOICE_CUR_ECNT, count_mask,
+                              count ? count - 1 : 0);
+        double start = voice_get_mask_nolock(d, c, v, lvl_reg, lvl_mask) * 8.0;
+        double fall = floor(start * exp(-(double)t / (2 * release_rate)));
+        double tail = floor(start * 2.0 * (release_rate * 15 - t) /
+                                (2048.0 * release_rate) +
+                            0.5);
+        return (t < release_rate * 11 ? MAX(fall, tail) : tail) / 2048.0;
     }
     case NV_PAVS_VOICE_PAR_STATE_EFCUR_FORCE_RELEASE:
-        if (count_mask == NV_PAVS_VOICE_CUR_ECNT_EACOUNT) {
+        if (amplitude) {
             voice_off_nolock(d, c, v);
         }
         return 0.0f;
@@ -1275,6 +1324,62 @@ static float voice_step_envelope(MCPXAPUState *d, uint8_t *c, uint16_t v,
         assert(false);
         return 0.0f;
     }
+}
+
+/* Steps the voice's two LFOs by one frame. A modulates amplitude, pitch and
+ * cutoff, F modulates pitch. The fields are as Xbox DirectSound's SetLFO
+ * packs them: TAR_LFO_ENV holds A's delta in bits 21:12 and F's in 31:22,
+ * TAR_LFO_MOD (70h) the signed depths (A amplitude, A pitch, A cutoff,
+ * F pitch, a byte each), PAR_LFO_DELAY (50h) the delays (A 14:0, F 30:16),
+ * enabled by MISC bits 14 and 15. Measured on a retail console: each LFO's
+ * 16-bit phase advances by its delta each frame, after its delay in frames,
+ * as a bipolar triangle that rises first. At full value a unit of depth is
+ * 8 attenuation units (1/8 dB), 32 pitch units or 256 cutoff units. */
+static void voice_step_lfos(MCPXAPUState *d, uint8_t *c, uint16_t v,
+                            float *attenuation, float *pitch, float *cutoff)
+{
+    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    if (!filter->lfo_armed) {
+        uint32_t misc =
+            voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_MISC, 0xFFFFFFFF);
+        filter->lfo_wait[0] =
+            (misc & NV_PAVS_VOICE_CFG_MISC_LFOA_DELAY_ENABLE) ?
+                voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_LFO_DELAY,
+                                      NV_PAVS_VOICE_PAR_LFO_DELAY_LFOA) :
+                0;
+        filter->lfo_wait[1] =
+            (misc & NV_PAVS_VOICE_CFG_MISC_LFOF_DELAY_ENABLE) ?
+                voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_LFO_DELAY,
+                                      NV_PAVS_VOICE_PAR_LFO_DELAY_LFOF) :
+                0;
+        filter->lfo_armed = true;
+    }
+
+    const uint32_t delta_mask[2] = { NV_PAVS_VOICE_TAR_LFO_ENV_LFOA_DELTA,
+                                     NV_PAVS_VOICE_TAR_LFO_ENV_LFOF_DELTA };
+    float value[2] = { 0.0f, 0.0f };
+    for (int k = 0; k < 2; k++) {
+        if (filter->lfo_wait[k]) {
+            filter->lfo_wait[k]--;
+            continue;
+        }
+        filter->lfo_phase[k] +=
+            voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_TAR_LFO_ENV, delta_mask[k]);
+        int p = filter->lfo_phase[k];
+        value[k] = (p < 0x4000 ? p :
+                    p < 0xC000 ? 0x8000 - p :
+                                 p - 0x10000) /
+                   16384.0f;
+    }
+
+    uint32_t mod = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_TAR_LFO_MOD, 0xFFFFFFFF);
+    int8_t a_amplitude = GET_MASK(mod, NV_PAVS_VOICE_TAR_LFO_MOD_LFOA_AMPLITUDE);
+    int8_t a_pitch = GET_MASK(mod, NV_PAVS_VOICE_TAR_LFO_MOD_LFOA_PITCH);
+    int8_t a_cutoff = GET_MASK(mod, NV_PAVS_VOICE_TAR_LFO_MOD_LFOA_CUTOFF);
+    int8_t f_pitch = GET_MASK(mod, NV_PAVS_VOICE_TAR_LFO_MOD_LFOF_PITCH);
+    *attenuation = a_amplitude * 8.0f * value[0];
+    *pitch = (a_pitch * value[0] + f_pitch * value[1]) * 32.0f;
+    *cutoff = a_cutoff * 256.0f * value[0];
 }
 
 static int voice_get_samples(MCPXAPUState *d, uint8_t *c, uint32_t v,
@@ -1594,15 +1699,11 @@ static int voice_get_samples(MCPXAPUState *d, uint8_t *c, uint32_t v,
     return sample_count;
 }
 
-static long voice_resample_callback(void *cb_data, float **data)
+/* Fills the voice's block of input, NUM_SAMPLES_PER_FRAME samples decoded
+ * from its buffer or stream (voice_get_samples), silence past its end. */
+static void voice_fill_block(MCPXAPUState *d, uint8_t *c, uint16_t v,
+                             MCPXAPUVoiceFilter *vf)
 {
-    MCPXAPUVoiceFilter *filter = cb_data;
-    uint16_t v = filter->voice;
-    assert(v < MCPX_HW_MAX_VOICES);
-    MCPXAPUState *d = container_of(filter, MCPXAPUState, vp.filters[v]);
-    /* The voice table voice_resample loaded. */
-    uint8_t *c = filter->cb_voice_cache;
-
     int sample_count = 0;
     while (sample_count < NUM_SAMPLES_PER_FRAME) {
         int active = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE,
@@ -1611,7 +1712,7 @@ static long voice_resample_callback(void *cb_data, float **data)
             break;
         }
         int count = voice_get_samples(
-            d, c, v, (float(*)[2]) & filter->resample_buf[2 * sample_count],
+            d, c, v, (float(*)[2]) & vf->resample_buf[2 * sample_count],
             NUM_SAMPLES_PER_FRAME - sample_count);
         if (count < 0) {
             break;
@@ -1620,96 +1721,98 @@ static long voice_resample_callback(void *cb_data, float **data)
     }
 
     if (sample_count < NUM_SAMPLES_PER_FRAME) {
-        /* Starvation causes SRC hang on repeated calls. Provide silence. */
-        memset(&filter->resample_buf[2*sample_count], 0,
-            2*(NUM_SAMPLES_PER_FRAME-sample_count)*sizeof(float));
-        sample_count = NUM_SAMPLES_PER_FRAME;
+        memset(&vf->resample_buf[2 * sample_count], 0,
+               2 * (NUM_SAMPLES_PER_FRAME - sample_count) * sizeof(float));
     }
-
-    *data = filter->resample_buf;
-    return sample_count;
 }
 
-static int voice_resample(MCPXAPUState *d, uint8_t *c, uint16_t v,
-                          float samples[][2],
-                          int requested_num, float rate)
+/* A frame of the voice's output through the 8-point Lagrange interpolator
+ * (lagrange_rows). steps are the cursor's advance per output sample in
+ * 16.16; the input is read a block at a time as the cursor needs it. Only
+ * channel 0 is interpolated when channels is 1 (a mono voice, or a 3D voice,
+ * which plays its channel 0 alone), and copied to channel 1. */
+static void voice_resample(MCPXAPUState *d, uint8_t *c, uint16_t v,
+                           float samples[NUM_SAMPLES_PER_FRAME][2],
+                           const uint32_t *steps, int channels)
 {
     assert(v < MCPX_HW_MAX_VOICES);
-    MCPXAPUVoiceFilter *filter = &d->vp.filters[v];
+    MCPXAPUVoiceFilter *vf = &d->vp.filters[v];
+    uint32_t pos = vf->interp_pos;
+    int idx = vf->interp_idx & 7;
+    int buf_pos = vf->resample_buf_pos;
 
-    if (filter->resampler == NULL) {
-        filter->voice = v;
-        int err;
-
-        /* Note: Using a sinc based resampler for quality. Unsure about
-         * hardware's actual interpolation method; it could just be linear, in
-         * which case using this resampler is overkill, but quality is good
-         * so use it for now.
-         */
-        // FIXME: Don't do 2ch resampling if this is a mono voice
-        filter->resampler = src_callback_new(&voice_resample_callback,
-                                           SRC_SINC_FASTEST, 2, &err, filter);
-        if (filter->resampler == NULL) {
-            fprintf(stderr, "src error: %s\n", src_strerror(err));
-            assert(0);
+    for (int n = 0; n < NUM_SAMPLES_PER_FRAME; n++) {
+        while (pos >= 0x10000) {
+            if (buf_pos >= NUM_SAMPLES_PER_FRAME) {
+                voice_fill_block(d, c, v, vf);
+                buf_pos = 0;
+            }
+            const float l = vf->resample_buf[2 * buf_pos];
+            const float r = vf->resample_buf[2 * buf_pos + 1];
+            vf->interp[idx][0] = vf->interp[idx + 8][0] = l;
+            vf->interp[idx][1] = vf->interp[idx + 8][1] = r;
+            idx = (idx + 1) & 7;
+            buf_pos++;
+            pos -= 0x10000;
         }
+
+        /* the last eight input samples, oldest first: x[3] is at the
+         * cursor, x[4] one sample past it */
+        const float (*x)[2] = &vf->interp[idx];
+        const uint32_t frac = pos;
+        float acc0 = x[3][0], acc1 = x[3][1];
+        if (frac) {
+            const float *lo = lagrange_rows[frac >> 8];
+            const float *hi = lagrange_rows[(frac >> 8) + 1];
+            const float a = (frac & 0xFF) / 256.0f;
+            float w[8];
+            for (int k = 0; k < 8; k++) {
+                w[k] = lo[k] + (hi[k] - lo[k]) * a;
+            }
+            acc0 = 0.0f;
+            for (int k = 0; k < 8; k++) {
+                acc0 += w[k] * x[k][0];
+            }
+            if (channels == 2) {
+                acc1 = 0.0f;
+                for (int k = 0; k < 8; k++) {
+                    acc1 += w[k] * x[k][1];
+                }
+            }
+        }
+        samples[n][0] = acc0;
+        samples[n][1] = channels == 2 ? acc1 : acc0;
+        pos += steps[n];
     }
 
-    /* The voice table through to the libsamplerate callback (whose
-     * signature we cannot extend), for the synchronous duration of
-     * src_callback_read. */
-    filter->cb_voice_cache = c;
-    int count = src_callback_read(filter->resampler, rate, requested_num,
-                                  (float *)samples);
-    filter->cb_voice_cache = NULL;
-    if (count == -1) {
-        DPRINTF("resample error\n");
-    }
-    if (count != requested_num) {
-        DPRINTF("resample returned fewer than expected: %d\n", count);
-
-        if (count == 0)
-            return -1;
-    }
-
-    return count;
+    vf->interp_pos = pos;
+    vf->interp_idx = idx;
+    vf->resample_buf_pos = buf_pos;
 }
 
-static int peek_ahead_multipass_bin(MCPXAPUState *d, uint8_t *c,
-                                    uint16_t v,
-                                    uint16_t *dst_voice)
+/* The cursor's advance for each sample of the frame, 2^(pitch / 4096) in
+ * 16.16. The pitch moves from the last frame's to this frame's in 32 steps
+ * across the frame, in its log form: on a retail console a pitch change from
+ * 0 to -1000h advanced the cursor 23 samples on that frame, the sum of
+ * 2^(-n/32), where stepping at once gives 16 and a linear ramp of the step
+ * 24. 2^(p_n / 4096) is geometric in n, so a moving pitch takes one
+ * exponential and a multiply a sample. */
+static void voice_pitch_steps(uint32_t steps[NUM_SAMPLES_PER_FRAME],
+                              double from, double to)
 {
-    bool first = true;
-
-    /* Bounded like the list walk in mcpx_apu_vp_frame: a list the title is
-     * relinking can hold a cycle without a multipass voice, and the worker
-     * looped on it for ever, holding the voice spinlocks of its batch while
-     * the vCPU's voice_lock spun on one (Forza, 2026-10-17: hung 160 s). */
-    for (int i = 0; v != 0xFFFF; i++) {
-        if (i >= MCPX_HW_MAX_VOICES) {
-            DPRINTF("Voice list contains a cycle!\n");
-            break;
+    double s = exp2(from / 4096.0) * 65536.0;
+    if (from == to) {
+        const uint32_t step = s;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            steps[i] = step;
         }
-        bool multipass = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_FMT,
-                                        NV_PAVS_VOICE_CFG_FMT_MULTIPASS);
-        if (multipass) {
-            if (first) {
-                break;
-            }
-
-            *dst_voice = v;
-            int mp_bin = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_FMT,
-                                        NV_PAVS_VOICE_CFG_FMT_MULTIPASS_BIN);
-            return mp_bin;
-        }
-
-        v = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
-                           NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
-        first = false;
+        return;
     }
-
-    *dst_voice = 0xFFFF;
-    return -1;
+    const double r = exp2((to - from) / (32.0 * 4096.0));
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        steps[i] = s;
+        s *= r;
+    }
 }
 
 static void get_multipass_samples(MCPXAPUState *d, uint8_t *c,
@@ -1720,9 +1823,19 @@ static void get_multipass_samples(MCPXAPUState *d, uint8_t *c,
     int mp_bin = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_FMT,
                                 NV_PAVS_VOICE_CFG_FMT_MULTIPASS_BIN);
 
+    /* The bin is read as 24-bit samples scaled up by 2^headroom, the voice
+     * format's headroom field, which undoes the bin headroom its voices were
+     * mixed with. On a retail console, from DC 008000h, a multipass voice
+     * gave 008000h at headroom 0 and 400000h at 7, and 008000h again when the
+     * source bin's headroom was 7 too. DirectSound sets both headrooms to 7,
+     * so read unscaled its submixes came out 42 dB too quiet. */
+    int headroom = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_FMT,
+                                         NV_PAVS_VOICE_CFG_FMT_HEADROOM);
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-        samples[i][0] = mixbins[mp_bin][i];
-        samples[i][1] = mixbins[mp_bin][i];
+        float x = floorf(mixbins[mp_bin][i] * 8388608.0f + 0.5f);
+        x = fminf(fmaxf(x, -8388608.0f), 8388607.0f) / 8388608.0f;
+        samples[i][0] = ldexpf(x, headroom);
+        samples[i][1] = samples[i][0];
     }
 
     // DirectSound sets clear mix to true
@@ -1730,6 +1843,23 @@ static void get_multipass_samples(MCPXAPUState *d, uint8_t *c,
                                     NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX);
     if (clear_mix) {
         memset(&mixbins[mp_bin][0], 0, sizeof(mixbins[0]));
+    }
+}
+
+/* A route's gain for each sample of the frame (route_gain's units times
+ * scale): from where the last frame ended to this frame's in 32 steps, each
+ * rounded down. */
+static inline void route_gain_ramp(float g[NUM_SAMPLES_PER_FRAME], float from,
+                                   float to, float scale)
+{
+    if (from == to) {   /* whole units: the steps are all the gain itself */
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            g[i] = to * scale;
+        }
+        return;
+    }
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        g[i] = floorf(from + (to - from) * (i / 32.0f)) * scale;
     }
 }
 
@@ -1744,6 +1874,8 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
                           uint16_t v, int voice_list)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    MCPXAPUVoiceFilter *vf = &d->vp.filters[v];
+    const bool three_d = v < MCPX_HW_MAX_3D_VOICES;
     bool stereo = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_FMT,
                                  NV_PAVS_VOICE_CFG_FMT_STEREO);
     unsigned int channels = stereo ? 2 : 1;
@@ -1765,7 +1897,14 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
                                NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH);
     int8_t ps = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_ENV0,
                                NV_PAVS_VOICE_CFG_ENV0_EF_PITCHSCALE);
-    float rate = 1.0 / powf(2.0f, (p + ps * 32 * ef_value) / 4096.0f);
+    float lfo_attenuation, lfo_pitch, lfo_cutoff;
+    voice_step_lfos(d, c, v, &lfo_attenuation, &lfo_pitch, &lfo_cutoff);
+    double pitch = p + ps * 32.0 * ef_value + lfo_pitch;
+
+    uint32_t steps[NUM_SAMPLES_PER_FRAME];
+    voice_pitch_steps(steps, vf->pitched ? vf->pitch : pitch, pitch);
+    vf->pitch = pitch;
+    vf->pitched = true;
 
     float ea_value = voice_step_envelope(
         d, c, v, NV_PAVS_VOICE_CFG_ENV0, NV_PAVS_VOICE_CFG_ENVA,
@@ -1778,11 +1917,15 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
 #if HAKUX_AUDIO_SKIP_MUTED
     /* Hoisted silence predicate: read the 8 mixbin vols BEFORE the resample
      * block so a muted voice can skip decode (in voice_get_samples, via
-     * cb_skip_decode) and SVF/HRTF/mix (early-return below). The resampler-
-     * driven pull loop still runs, so CBO/SSL/SSLA_DONE/loop/voice_off advance
-     * bit-exactly (the loop trip count and num_samples_requested are value-
-     * independent of the decoded samples; we only null the sample VALUES). */
+     * cb_skip_decode) and filters/mix (early-return below). The resampler
+     * still pulls its input, so CBO/SSL/SSLA_DONE/loop/voice_off advance
+     * bit-exactly (we only null the sample VALUES). A voice whose routes
+     * ended the last frame audible is not skipped: its gains ramp down to
+     * silence across this one. */
     bool skip_muted = voice_all_vols_maxed(d, c, v);
+    for (int b = 0; b < 8 && skip_muted; b++) {
+        skip_muted = vf->route_gain[b] == 0.0f;
+    }
 #endif
 
     float samples[NUM_SAMPLES_PER_FRAME][2] = { 0 };
@@ -1792,30 +1935,20 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
 
 #if !defined(HAKUX_AUDIO_NO_PROCESS) || !HAKUX_AUDIO_NO_PROCESS
 #if HAKUX_AUDIO_SKIP_MUTED
-    /* Thread the per-voice skip decision into voice_get_samples (reached via
-     * voice_resample -> src_callback_read -> voice_resample_callback). Valid
-     * only for the synchronous duration of the resample loop below, same
-     * lifetime contract as cb_voice_cache. Multipass voices have no decode
-     * loop, so this is consumed only on the non-multipass path. */
-    d->vp.filters[v].cb_skip_decode = skip_muted;
+    /* the per-voice skip decision for voice_get_samples (through
+     * voice_resample -> voice_fill_block), for this frame's resample only.
+     * Multipass voices have no decode loop. */
+    vf->cb_skip_decode = skip_muted;
 #endif
     if (multipass) {
         get_multipass_samples(d, c, mixbins, v, samples);
     } else {
-        for (int sample_count = 0; sample_count < NUM_SAMPLES_PER_FRAME;) {
-            int active = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE,
-                                        NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-            if (!active) {
-                return;
-            }
-            int count =
-                voice_resample(d, c, v, &samples[sample_count],
-                               NUM_SAMPLES_PER_FRAME - sample_count, rate);
-            if (count < 0) {
-                break;
-            }
-            sample_count += count;
+        int active = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE,
+                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
+        if (!active) {
+            return;
         }
+        voice_resample(d, c, v, samples, steps, (stereo && !three_d) ? 2 : 1);
     }
 
     int active = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_PAR_STATE,
@@ -1835,14 +1968,25 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
      * which would normally advance NV_PAVS_VOICE_PAR_OFFSET_CBO and the
      * SSL segment/end-of-buffer / SSLA_DONE notifier / voice_off() path.
      * Titles that drive playback off CBO/SSL polling may stall; this is
-     * an FPS-cost probe, not a shippable audio mode. (void)samples;
-     * (void)multipass; (void)rate; (void)mixbins; */
+     * an FPS-cost probe, not a shippable audio mode. */
     (void)samples;
     (void)multipass;
-    (void)rate;
+    (void)steps;
     (void)mixbins;
     return;
 #endif
+
+    /* A 3D voice plays its channel 0 alone, as a mono voice. On a retail
+     * console a stereo 3D voice with 4000h on the left channel and 1000h on
+     * the right, through an HRTF entry, gave both ears and routes 4-7 the
+     * left channel only, filtered as a mono 3D voice's. */
+    if (three_d && stereo) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            samples[i][1] = samples[i][0];
+        }
+        stereo = false;
+        channels = 1;
+    }
 
     int bin[8];
     bin[0] = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_VBIN,
@@ -1862,7 +2006,7 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
     bin[7] = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_FMT,
                             NV_PAVS_VOICE_CFG_FMT_V7BIN);
 
-    if (v < MCPX_HW_MAX_3D_VOICES) {
+    if (three_d) {
         bin[0] = d->vp.hrtf_submix[0];
         bin[1] = d->vp.hrtf_submix[1];
         bin[2] = d->vp.hrtf_submix[2];
@@ -1898,13 +2042,13 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
 
 #if PERF_LOG
     /* Silent-but-active voice probe (read-only; no control-flow change).
-     * This call has done the full resample+SVF work and has both predicate
+     * This call has done the full resample work and has both predicate
      * inputs live: ea_value (the EA amplitude envelope) and vol[0..7]. */
     {
         bool ea0 = (ea_value == 0.0f);
         bool allvol_max = true;
         for (int i = 0; i < 8; i++) {
-            if ((vol[i] & 0xFFF) != 0xFFF) { /* attenuate(vol[i]) != 0 */
+            if ((vol[i] & 0xFFF) != 0xFFF) { /* the route is audible */
                 allvol_max = false;
                 break;
             }
@@ -1928,88 +2072,180 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
     //        we should modify volume of bin6 and bin7 here.
 
 #if HAKUX_AUDIO_SKIP_MUTED
-    /* Muted voice: the resample loop above already advanced CBO/SSL/SSLA_DONE/
-     * loop/voice_off bit-exactly. The remaining SVF / HRTF / 8x mix all
-     * accumulate scaled by attenuate(vol[b])==0, so they contribute ZERO --
-     * skip them. Remember the mute so SVF/HRTF IIR state is reset-to-rest on
-     * the next audible frame (filters froze mid-decay; resuming from a frozen-
-     * but-stale state could click). This early-return is reached for BOTH the
-     * multipass and non-multipass branches (it is after the if/else above). */
+    /* Muted voice: the resample above already advanced CBO/SSL/SSLA_DONE/
+     * loop/voice_off bit-exactly. Every route is at FFFh (silent even under
+     * the amplitude LFO) and ended the last frame silent, so the filters and
+     * mix contribute ZERO -- skip them. Remember the mute so the filter state
+     * is reset-to-rest on the next audible frame. */
     if (skip_muted) {
 #if PERF_LOG
         VP_ADD(skipped_voices, 1);
 #endif
-        d->vp.filters[v].muted_prev = true;
+        vf->gains = true;
+        vf->muted_prev = true;
         return;
     }
-#endif
-
-#if HAKUX_AUDIO_SKIP_MUTED
-    /* Audible this frame (skip_muted was false -> we did not early-return). If
-     * this voice was muted last audible frame, its SVF integrators and HRTF
-     * ring were frozen mid-decay across the muted frames. Resume from REST
-     * instead of the stale frozen state to avoid an un-mute transient/click.
-     * Un-mute in real titles is almost always a volume RAMP, so the first
-     * audible frames are near-silent and the from-rest transient is masked.
-     * (Bit-exact reconstruction would require running the filters over the
-     * muted-frame input -- exactly the decode we skipped.) */
-    if (d->vp.filters[v].muted_prev) {
-        memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
-        for (int ch = 0; ch < 2; ch++) {
-            memset(d->vp.filters[v].hrtf.ch[ch].buf, 0,
-                   sizeof(d->vp.filters[v].hrtf.ch[ch].buf));
-        }
-        d->vp.filters[v].muted_prev = false;
+    /* Audible this frame. If this voice was muted, its filters were frozen
+     * mid-decay across the muted frames: resume from rest instead. */
+    if (vf->muted_prev) {
+        memset(vf->svf, 0, sizeof(vf->svf));
+        memset(vf->peq, 0, sizeof(vf->peq));
+        memset(vf->i3dl2, 0, sizeof(vf->i3dl2));
+        hrtf_filter_clear_history(&vf->hrtf);
+        vf->muted_prev = false;
     }
 #endif
 
     int fmode = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_MISC,
                                NV_PAVS_VOICE_CFG_MISC_FMODE);
 
-    // FIXME: Move to function
-    bool lpf = false;
-    if (v < MCPX_HW_MAX_3D_VOICES) {
+    uint16_t hrtf_handle = HRTF_NULL_HANDLE;
+    if (three_d) {
+        hrtf_handle = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
+                                            NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
+    }
+    /* A 3D voice whose HRTF entry is FFFFh filters as a 2D voice and has no
+     * I3DL2 filter: on a retail console mode 3 ran DLS2 from FCA and then the
+     * ParaEQ from FCB on routes 4-7 alike, mode 2 the ParaEQ from FCB, and
+     * mode 1 DLS2 alone. */
+    const bool spatial = three_d && hrtf_handle != HRTF_NULL_HANDLE;
+    bool lpf, peq;
+    if (spatial) {
         /* 1:DLS2+I3DL2 2:ParaEQ+I3DL2 3:I3DL2 */
         lpf = (fmode == 1);
+        peq = (fmode == 2);
     } else {
         /* 0:Bypass 1:DLS2 2:ParaEQ 3(Mono):DLS2+ParaEQ 3(Stereo):Bypass */
         lpf = stereo ? (fmode == 1) : (fmode & 1);
+        peq = stereo ? (fmode == 2) : (fmode >= 2);
     }
+
+    /* The F envelope moves the DLS2 and ParaEQ frequencies by its FC scale
+     * (ENV1 bits 31:24), 256 units, a 16th of an octave, per step at full
+     * level, and the A LFO by its cutoff depth. On a retail console an fs/4
+     * tone through the DLS2 filter at C000h, with the F envelope's attack at
+     * scale +64, came out 1/8 octave higher each frame up to 4 octaves, and
+     * the same through the ParaEQ's cut. Each coefficient moves from the
+     * last frame's to this frame's across the frame, linearly in f: stepped
+     * at once, a frame's peak came out up to 10% high. Only channel 0 is
+     * filtered on a mono voice (channel 1 is its copy). */
+    int8_t fc_scale = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_ENV1,
+                                            NV_PAVS_VOICE_CFG_ENV1_EF_FCSCALE);
+    double fc_bend = fc_scale * 256.0 * ef_value + lfo_cutoff;
+
+    /* DLS2: the state-variable low-pass, f from FC0 (filter_coefficient), its
+     * damping FC1 / 32768 with no lower clamp (FC1 0 self-oscillated on the
+     * console, 400h and 800h rang as the unclamped filter does), its output
+     * not clamped to full scale either. */
     if (lpf) {
-        for (int ch = 0; ch < 2; ch++) {
-            // FIXME: Cutoff modulation via NV_PAVS_VOICE_CFG_ENV1_EF_FCSCALE
-            int16_t fc = voice_get_mask_nolock(
-                d, c, v, NV_PAVS_VOICE_TAR_FCA + (ch % channels) * 4,
-                NV_PAVS_VOICE_TAR_FCA_FC0);
-            float fc_f = clampf(pow(2, fc / 4096.0), 0.003906f, 1.0f);
-            uint16_t q = voice_get_mask_nolock(
-                d, c, v, NV_PAVS_VOICE_TAR_FCA + (ch % channels) * 4,
-                NV_PAVS_VOICE_TAR_FCA_FC1);
-            float q_f = clampf(q / (1.0 * 0x8000), 0.079407f, 1.0f);
-            sv_filter *filter = &d->vp.filters[v].svf[ch];
+        for (unsigned int ch = 0; ch < channels; ch++) {
+            uint32_t fca = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_TAR_FCA + ch * 4,
+                                                 0xFFFFFFFF);
+            int16_t fc = GET_MASK(fca, NV_PAVS_VOICE_TAR_FCA_FC0);
+            uint16_t q = GET_MASK(fca, NV_PAVS_VOICE_TAR_FCA_FC1);
+            float fc_f = filter_coefficient(fc + fc_bend);
+            float f_from = vf->dls2_set ? vf->dls2_f[ch] : fc_f;
+            vf->dls2_f[ch] = fc_f;
+            /* at most 1: the console was measured up to 8000h (1.0), and past
+             * about 1.5 the filter diverges with f near 1, which the console
+             * can't (Medal of Honor: European Assault's voices run FC0 0 and
+             * FC1 FFFFh, f 1 and damping 2: unbounded, their samples went to
+             * NaN and the whole mix to full scale) */
+            float q_f = fminf(q / (1.0f * 0x8000), 1.0f);
+            sv_filter *filter = &vf->svf[ch];
             setup_svf(filter, fc_f, q_f, F_LP);
             for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                filter->f = f_from + (fc_f - f_from) * (i / 32.0f);
                 samples[i][ch] = run_svf(filter, samples[i][ch]);
-                samples[i][ch] = fminf(fmaxf(samples[i][ch], -1.0f), 1.0f);
             }
         }
     }
+    vf->dls2_set = lpf;
 
-    if (v < MCPX_HW_MAX_3D_VOICES && g_apu_config.hrtf) {
-        uint16_t hrtf_handle =
-            voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
-                           NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
-        if (hrtf_handle != HRTF_NULL_HANDLE) {
-            hrtf_filter_process(&d->vp.filters[v].hrtf, samples, samples);
+    /* ParaEQ: the DLS2 filter's SVF as a peaking EQ, y = x + G * q * band,
+     * its output rounded as the filter's steps are. Its word's bits 15:0 give
+     * the frequency in the DLS2 log form and bits 31:16 the signed gain,
+     * G = gain / 8192; MISC bits 20:18 give q = 2^-Q. The word is FCB on mono
+     * 2D voices, FCA on 3D voices (whose FCB is the I3DL2's), and FCA for
+     * channel 0 and FCB for channel 1 on stereo voices. A retail console's
+     * impulse responses at four frequencies, gains -4 to +2 and Q 0 to 7, in
+     * each layout, match this. */
+    if (peq) {
+        int q_field = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_MISC,
+                                            NV_PAVS_VOICE_CFG_MISC_PARAEQ_Q);
+        float q_f = ldexpf(1.0f, -q_field);
+        for (unsigned int ch = 0; ch < channels; ch++) {
+            uint64_t reg = spatial ? NV_PAVS_VOICE_TAR_FCA :
+                           stereo  ? NV_PAVS_VOICE_TAR_FCA + ch * 4 :
+                                     NV_PAVS_VOICE_TAR_FCB;
+            uint32_t word = voice_get_mask_nolock(d, c, v, reg, 0xFFFFFFFF);
+            float fc_f = filter_coefficient((int16_t)(word & 0xFFFF) + fc_bend);
+            float f_from = vf->peq_set ? vf->peq_f[ch] : fc_f;
+            vf->peq_f[ch] = fc_f;
+            float g = (int16_t)(word >> 16) / 8192.0f * q_f;
+            sv_filter *filter = &vf->peq[ch];
+            setup_svf(filter, fc_f, q_f, F_BP);
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                filter->f = f_from + (fc_f - f_from) * (i / 32.0f);
+                samples[i][ch] = svf_round(samples[i][ch] +
+                                           g * run_svf(filter, samples[i][ch]));
+            }
+        }
+    }
+    vf->peq_set = peq;
+
+    if (channels == 1) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            samples[i][1] = samples[i][0];
         }
     }
 
-    // FIXME: ParaEQ
+    /* I3DL2: a 3D voice's pair of one-pole low-passes, y = (1 - a) x + a y',
+     * each value rounded as the SVF's are, with a = FCB 15:0 / 65536 for the
+     * direct path and FCB 31:16 / 65536 for the room path. On a retail
+     * console 2000h gave 0.875 * 0.125^n and C000h 0.25 * 0.75^n, exactly,
+     * and an impulse through a path with a = 8000h settled at 10h for good,
+     * which only the rounding explains. The direct path feeds routes 0-4 and
+     * 6 and the room path routes 5 and 7, in filter modes 1, 2 and 3
+     * alike. */
+    float room[NUM_SAMPLES_PER_FRAME];
+    const bool i3dl2 = spatial && fmode != 0 && !stereo;
+    if (i3dl2) {
+        uint32_t fcb = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_TAR_FCB, 0xFFFFFFFF);
+        float a_direct = (fcb & 0xFFFF) / 65536.0f;
+        float a_room = (fcb >> 16) / 65536.0f;
+        float *state = vf->i3dl2;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float x = samples[i][0];
+            state[0] = svf_round(x + (state[0] - x) * a_direct);
+            state[1] = svf_round(x + (state[1] - x) * a_room);
+            samples[i][0] = samples[i][1] = state[0];
+            room[i] = state[1];
+        }
+    }
 
-    /* Deinterleave samples[32][2] into per-channel contiguous buffers once
-     * (amortized across 8 subsequent mix_one_bin calls). mix_one_bin
-     * (NEON-accelerated on aarch64) reads contiguous float[32]. */
+    /* Routes 0-1 of a 3D voice carry the HRTF's left ear and routes 2-3 its
+     * right ear; its routes 4-7 carry the voice itself, not the HRTF output;
+     * without an HRTF entry (FFFFh) routes 0-3 are silent (measured on a
+     * retail console). The voice reads its entry every frame, so rewriting
+     * the entry or moving the voice to another one takes effect on the next
+     * frame. */
+    float ears[NUM_SAMPLES_PER_FRAME][2];
+    if (spatial) {
+        if (g_apu_config.hrtf && APU_CHECK(hrtf_handle < HRTF_ENTRY_COUNT)) {
+            hrtf_filter_set_target_params(&vf->hrtf,
+                                          d->vp.hrtf.entries[hrtf_handle].hrir,
+                                          d->vp.hrtf.entries[hrtf_handle].itd);
+            hrtf_filter_process(&vf->hrtf, samples, ears);
+        } else {
+            memcpy(ears, samples, sizeof(ears));
+        }
+    }
+
+    /* Each route's source as a frame of contiguous samples (mix_one_bin
+     * reads contiguous float[32]) */
     float channel_buf[2][NUM_SAMPLES_PER_FRAME];
+    float ear_buf[2][NUM_SAMPLES_PER_FRAME];
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
         channel_buf[0][i] = samples[i][0];
     }
@@ -2018,87 +2254,118 @@ static void voice_process(MCPXAPUState *d, uint8_t *c,
             channel_buf[1][i] = samples[i][1];
         }
     }
-
-    /* The VP's own mix (the default, no DSP): the frame's mixbins are
-     * cleared unread at its end, but for the multipass bin the next voices
-     * of a group read (scheduled together, voice_work_schedule) */
-    const bool mon_vp = d->monitor.point == MCPX_APU_DEBUG_MON_VP;
-    for (int b = 0; b < 8; b++) {
-        if (mon_vp && bin[b] != MULTIPASS_BIN) {
-            continue;
+    if (spatial) {
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            ear_buf[0][i] = ears[i][0];
+            ear_buf[1][i] = ears[i][1];
         }
-        float g = ea_value;
-        float hr;
-        if ((v < MCPX_HW_MAX_3D_VOICES) && (b < 4)) {
-            // FIXME: Not sure if submix/voice headroom factor in for HRTF
-            hr = 1 << d->vp.hrtf_headroom;
-        } else {
-            hr = 1 << d->vp.submix_headroom[bin[b]];
-        }
-        g *= attenuate(vol[b]) / hr;
-        mix_one_bin(mixbins[bin[b]], channel_buf[b % channels], g);
     }
 
-    if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
-        /* For VP mon, simply mix all voices together here, selecting the
-         * maximal volume used for any given mixbin as the overall volume for
-         * this voice.
-         *
-         * If the current voice belongs to a multipass sub-voice group we must
-         * skip it here to avoid mixing it in twice because the sub-voices are
-         * mixed into the multipass bin and that sub-mix will be mixed in here
-         * later when the destination (i.e. second pass) voice is processed.
-         * TODO: Are the 2D, 3D and MP voice lists merely a DirectSound
-         *       convention? Perhaps hardware doesn't care if e.g. a multipass
-         *       voice is in the 2D or 3D list. On the other hand, MON_VP is
-         *       not how the hardware works anyway so not much point worrying
-         *       about precise emulation here. DirectSound compatibility is
-         *       enough.
-         */
-        int mp_bin = -1;
-        uint16_t mp_dst_voice = 0xFFFF;
-        if (voice_list == NV1BA0_PIO_SET_ANTECEDENT_VOICE_LIST_MP_TOP - 1) {
-            mp_bin = peek_ahead_multipass_bin(d, c, v, &mp_dst_voice);
+    /* A route's gain, in 1/16384, is its attenuation's gain times the
+     * amplitude envelope's level in 2048ths, rounded down, the attenuation
+     * moved by the A LFO (a route at FFFh stays silent under a negative
+     * one). It moves from where the last frame ended to this frame's in 32
+     * steps across the frame, each sample's gain rounded down, and a new
+     * voice fades in from silence over its first frame. On a retail console
+     * a volume change read sample n of its frame n/32 of the way, a DC
+     * voice's first frame rose 0, 1/4, 1/2, 3/4 and 31/32 of its level at
+     * samples 0, 8, 16, 24 and 31, and sustain 80h at attenuation 100h gave
+     * 5188/16384. Stepped at frame edges, envelopes buzzed at the 1.5 kHz
+     * frame rate and volume changes clicked. The bin's headroom applies to
+     * HRTF submixes too: the HRTF headroom had no measurable effect on
+     * hardware (at 1 the submixes and the voice's other routes came out as
+     * at 0). */
+    const uint32_t level = lrintf(ea_value * 2048.0f);
+    const int lfo_att = (int)floorf(lfo_attenuation);
+    float g_from[8], g_to[8], scale[8];
+    bool live[8];
+    const float *src[8];
+    for (int b = 0; b < 8; b++) {
+        live[b] = false;
+        if (three_d && b < 4 && !spatial) {
+            vf->route_gain[b] = 0.0f;
+            continue;
         }
+        g_from[b] = vf->gains ? vf->route_gain[b] : 0.0f;
+        g_to[b] = 0.0f;
+        if (vol[b] != 0xFFF) {
+            g_to[b] = (attenuation_gain(vol[b] + lfo_att) * level) >> 11;
+        }
+        vf->route_gain[b] = g_to[b];
+        live[b] = g_from[b] != 0.0f || g_to[b] != 0.0f;
+        scale[b] = 1.0f / (float)(16384 << d->vp.submix_headroom[bin[b]]);
+        src[b] = (three_d && b < 4)            ? ear_buf[b / 2] :
+                 (i3dl2 && (b == 5 || b == 7)) ? room :
+                                                 channel_buf[b % channels];
+    }
+    vf->gains = true;
 
-        float g = 0.0f;
+    /* The VP's own mix (the default, no DSP): the frame's mixbins are
+     * cleared unread at its end, but for the bins a multipass voice reads,
+     * which the next voices of its group read (scheduled together,
+     * voice_work_schedule) */
+    const bool mon_vp = d->monitor.point == MCPX_APU_DEBUG_MON_VP;
+    const uint32_t mp_bins = d->vp.voice_work_dispatch.mp_bins;
+    for (int b = 0; b < 8; b++) {
+        if (!live[b] || (mon_vp && !(mp_bins & (1u << bin[b])))) {
+            continue;
+        }
+        if (g_from[b] == g_to[b]) {
+            mix_one_bin(mixbins[bin[b]], src[b], g_to[b] * scale[b]);
+        } else {
+            float g[NUM_SAMPLES_PER_FRAME];
+            route_gain_ramp(g, g_from[b], g_to[b], scale[b]);
+            mix_one_bin_ramp(mixbins[bin[b]], src[b], g);
+        }
+    }
+
+    if (mon_vp) {
+        /* For VP mon, simply mix all voices together here, selecting the
+         * maximal gain of any of the voice's routes, sample by sample, as the
+         * overall gain for this voice; a 3D voice with an HRTF entry plays its
+         * two ears.
+         *
+         * Routes into a bin a multipass voice reads are left out: they are
+         * mixed into the bin instead, and that sub-mix is mixed in here when
+         * the multipass voice is processed. MON_VP is not how the hardware
+         * works anyway (the DSP mixes the bins), so DirectSound compatibility
+         * is enough. */
+        float g[NUM_SAMPLES_PER_FRAME] = { 0 };
+        float gb[NUM_SAMPLES_PER_FRAME];
         for (int b = 0; b < 8; b++) {
-            if (bin[b] == mp_bin) {
+            if (!live[b] || (mp_bins & (1u << bin[b]))) {
                 continue;
             }
-            float hr = 1 << d->vp.submix_headroom[bin[b]];
-            g = fmax(g, attenuate(vol[b]) / hr);
+            route_gain_ramp(gb, g_from[b], g_to[b], scale[b]);
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                g[i] = fmaxf(g[i], gb[i]);
+            }
         }
-        g *= ea_value;
+        const float *left = spatial ? ear_buf[0] : channel_buf[0];
+        const float *right = spatial ? ear_buf[1] : channel_buf[channels - 1];
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            sample_buf[i][0] += g*samples[i][0];
-            sample_buf[i][1] += g*samples[i][1];
+            sample_buf[i][0] += g[i] * left[i];
+            sample_buf[i][1] += g[i] * right[i];
         }
         if (g_apu_out_channels == 6) {
             /* 5.1: each of the voice's speaker mixbins (DirectSound's 0-5:
-             * FL FR C LFE BL BR) at its own volume. One in none of them (a
+             * FL FR C LFE BL BR) at its own gain. One in none of them (a
              * submix, an effect's send: the DSP's, not run here) plays in
              * the front pair, as in stereo. */
             bool spoke = false;
             for (int b = 0; b < 8; b++) {
-                if (bin[b] == mp_bin || bin[b] < 0 || bin[b] > 5) {
-                    continue;
-                }
-                const float hr = (v < MCPX_HW_MAX_3D_VOICES && b < 4) ? (float)(1 << d->vp.hrtf_headroom)
-                                                                    : (float)(1 << d->vp.submix_headroom[bin[b]]);
-                const float gb = ea_value * attenuate(vol[b]) / hr;
-                if (gb <= 0) {
+                if (!live[b] || (mp_bins & (1u << bin[b])) || bin[b] > 5) {
                     continue;
                 }
                 spoke = true;
-                const float *src = channel_buf[b % channels];
+                route_gain_ramp(gb, g_from[b], g_to[b], scale[b]);
                 for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-                    sample6[i][bin[b]] += gb * src[i];
+                    sample6[i][bin[b]] += gb[i] * src[b][i];
                 }
             }
             for (int i = 0; !spoke && i < NUM_SAMPLES_PER_FRAME; i++) {
-                sample6[i][0] += g * samples[i][0];
-                sample6[i][1] += g * samples[i][1];
+                sample6[i][0] += g[i] * left[i];
+                sample6[i][1] += g[i] * right[i];
             }
         }
     }
@@ -2118,9 +2385,9 @@ static void get_voice_bin_src_dst(MCPXAPUState *d, uint8_t *c, int v,
                                     NV_PAVS_VOICE_CFG_FMT_MULTIPASS_BIN);
         bool clear_mix = voice_get_mask_nolock(d, c, v, NV_PAVS_VOICE_CFG_FMT,
                                         NV_PAVS_VOICE_CFG_FMT_CLEAR_MIX);
-        src_v |= (1 << mp_bin);
+        src_v |= (1u << mp_bin);
         if (clear_mix) {
-            clr_v |= (1 << mp_bin);
+            clr_v |= (1u << mp_bin);
         }
     }
 
@@ -2150,7 +2417,7 @@ static void get_voice_bin_src_dst(MCPXAPUState *d, uint8_t *c, int v,
                             NV_PAVS_VOICE_CFG_FMT_V7BIN);
 
     for (int i = 0; i < 8; i++) {
-        dst_v |= 1 << bin[i];
+        dst_v |= 1u << bin[i];
     }
 
     if (src) {
@@ -2175,9 +2442,11 @@ static void voice_work_share(MCPXAPUState *d, VoiceWorker *self)
     // Process queued voices
     const bool mon_vp = d->monitor.point == MCPX_APU_DEBUG_MON_VP;
     if (mon_vp) {
-        /* only the multipass bin is mixed (voice_process), and it stays in
-         * the share: its group is scheduled together */
-        memset(self->mixbins[MULTIPASS_BIN], 0, sizeof(self->mixbins[0]));
+        /* only the bins a multipass voice reads are mixed (voice_process),
+         * and they stay in the share: their group is scheduled together */
+        for (uint32_t m = vwd->mp_bins; m; m &= m - 1) {
+            memset(self->mixbins[ctz32(m)], 0, sizeof(self->mixbins[0]));
+        }
         memset(self->sample_buf, 0, sizeof(self->sample_buf));
         if (g_apu_out_channels == 6) {
             memset(self->sample6, 0, sizeof(self->sample6));
@@ -2369,28 +2638,39 @@ static void voice_work_schedule(MCPXAPUState *d, uint8_t *c)
     bool group = false;
     uint32_t dirty = 0;
 
+    // To simplify submix scheduling, voices are grouped by DirectSound's
+    // multipass layout:
+    //
+    // - MP bin is constant
+    // - MP voice always clears MP bin
+    // - MP source voices are ordered consecutively in voice lists
+    //
+    // Hardware takes any bin: on a retail console multipass voices reading
+    // bins 9 and 12 mixed correctly. A frame that departs from the layout
+    // runs all its voices in list order on one worker.
+    bool serial = false;
+    uint32_t mp_bins = 0;
+    for (int i = 0; i < vwd->queue_len; i++) {
+        uint32_t src, dst, clr;
+        get_voice_bin_src_dst(d, c, vwd->queue[i].voice, &src, &dst, &clr);
+        if ((src && (src != MULTIPASS_BIN_MASK || clr != MULTIPASS_BIN_MASK)) ||
+            (!src && !(dst & MULTIPASS_BIN_MASK) &&
+             (dirty & MULTIPASS_BIN_MASK))) {
+            serial = true;
+        }
+        mp_bins |= src;
+        dirty = (dirty & ~clr) | dst;
+    }
+    vwd->mp_bins = mp_bins;
+    dirty = 0;
+
     for (int i = 0; i < vwd->queue_len; i++) {
         uint32_t src, dst, clr;
         get_voice_bin_src_dst(d, c, vwd->queue[i].voice, &src, &dst, &clr);
 
-        // TODO: To simplify submix scheduling, we make a few assumptions based
-        // on Xbox software observations. However, the configurability of
-        // multipass sources suggests the hardware may not be so strict. We'll
-        // defer making this more robust for now.
-        //
-        // We currently assume that:
-        //
-        // - MP bin is constant
-        assert(!src || (src == MULTIPASS_BIN_MASK));
-        //
-        // - MP voice always clears MP bin
-        assert(!src || (clr == MULTIPASS_BIN_MASK));
-        //
-        // - MP source voices are ordered consecutively in voice lists
-        assert(src || (dst & MULTIPASS_BIN_MASK) ||
-               !(dirty & MULTIPASS_BIN_MASK));
-
-        if ((dst & MULTIPASS_BIN_MASK) & ~dirty) {
+        if (serial) {
+            group = true;
+        } else if ((dst & MULTIPASS_BIN_MASK) & ~dirty) {
             group = true;
         }
 
@@ -2400,7 +2680,7 @@ static void voice_work_schedule(MCPXAPUState *d, uint8_t *c)
         vwd->workers_pending |= 1 << next_worker_to_schedule;
 
         dirty = (dirty & ~clr) | dst;
-        if (clr & MULTIPASS_BIN_MASK) {
+        if ((clr & MULTIPASS_BIN_MASK) && !serial) {
             group = false;
         }
 
@@ -2666,6 +2946,8 @@ void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_P
 void mcpx_apu_vp_init(MCPXAPUState *d)
 {
     attenuation_init();
+    filter_coefficient_init();
+    lagrange_init();
     for (int i = 0; i < MCPX_HW_MAX_VOICES; i++) {
         apu_spin_init(&d->vp.voice_spinlocks[i]);
     }
@@ -2689,6 +2971,9 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
 {
     d->vp.ssl_base_page = 0;
     d->vp.hrtf_headroom = 0;
+    /* no entries, in no decode yet: a savestate's come with their field, or
+     * are taken as two's complement (mcpx_apu_vp_restore_hrtf) */
+    memset(&d->vp.hrtf, 0, sizeof(d->vp.hrtf));
     d->vp.hrir_sm = 0;
     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
     memset(d->vp.hrtf_submix, 0, sizeof(d->vp.hrtf_submix));
@@ -2698,47 +2983,44 @@ void mcpx_apu_vp_reset(MCPXAPUState *d)
     memset(d->vp.voice_wrote, 0, sizeof(d->vp.voice_wrote));
     memset(g_off_pending, 0, sizeof(g_off_pending));
     g_idle_last = 0xFFFF;
+    /* each voice as a new voice: a savestate without the voices' processing
+     * state starts them so (a frame's fade in from silence) */
     for (int v = 0; v < ARRAY_SIZE(d->vp.filters); v++) {
         hrtf_filter_init(&d->vp.filters[v].hrtf);
+        voice_reset_filters(d, v);
+        d->vp.filters[v].muted_prev = false;
     }
     refresh_table(&d->vp.voice_cache, 0, 0);
     refresh_table(&d->vp.ssl_cache, 0, 0);
 }
 
-/* After a savestate (the voice table's pointer set): each 3D voice's HRTF
- * filter aimed again at the entry its voice names, as SET_VOICE_TAR_HRTF
- * did (the entries come with the APU's state, the handles with RAM): a 3D
- * voice whose parameters the title doesn't commit again was silent. */
+/* After a savestate: the HRTF entries' taps in the minifloat decode
+ * (hrir_tap_to_float). The entries are stored decoded, so a state from an
+ * earlier decode has each tap's byte recovered first: hrir_sm 1 held
+ * (sign ? -mag : mag) / 128, hrir_sm 0 (or no such field) two's complement
+ * / 128, both exact in a float. The 3D voices read their entry each frame
+ * (voice_process), so nothing else needs aiming again. */
 void mcpx_apu_vp_restore_hrtf(MCPXAPUState *d)
 {
-    /* a savestate from before the taps were read as sign and magnitude:
-     * each tap's byte again (two's complement, x 128), read so */
-    if (!d->vp.hrir_sm) {
+    if (d->vp.hrir_sm != 2) {
         for (unsigned e = 0; e < HRTF_ENTRY_COUNT; e++) {
             for (int ch = 0; ch < 2; ch++) {
                 for (int k = 0; k < HRTF_NUM_TAPS; k++) {
                     float *t = &d->vp.hrtf.entries[e].hrir[ch][k];
-                    const uint8_t b = (uint8_t)(int8_t)lrintf(*t * 128.0f);
-                    const int mag = b & 0x7F;
-                    *t = (float)(b & 0x80 ? -mag : mag) / 128.0f;
+                    uint8_t b;
+                    if (d->vp.hrir_sm == 1) {
+                        const int mag = (int)lrintf(fabsf(*t) * 128.0f) & 0x7F;
+                        b = (uint8_t)((*t < 0.0f ? 0x80 : 0) | mag);
+                    } else {
+                        b = (uint8_t)(int8_t)lrintf(*t * 128.0f);
+                    }
+                    *t = hrir_tap_to_float(b);
                 }
             }
         }
-        d->vp.hrir_sm = 1;
+        d->vp.hrir_sm = 2;
     }
-    if (!d->regs[NV_PAPU_VPVADDR]) {
-        return;
-    }
-    unsigned set = 0, entries = 0;
-    for (uint16_t v = 0; v < MCPX_HW_MAX_3D_VOICES; v++) {
-        unsigned handle = voice_get_mask(d, v, NV_PAVS_VOICE_CFG_HRTF_TARGET,
-                                         NV_PAVS_VOICE_CFG_HRTF_TARGET_HANDLE);
-        if (handle != HRTF_NULL_HANDLE && handle < HRTF_ENTRY_COUNT) {
-            hrtf_filter_set_target_params(&d->vp.filters[v].hrtf, d->vp.hrtf.entries[handle].hrir,
-                                          d->vp.hrtf.entries[handle].itd);
-            set++;
-        }
-    }
+    unsigned entries = 0;
     for (unsigned e = 0; e < HRTF_ENTRY_COUNT; e++) {
         bool any = d->vp.hrtf.entries[e].itd != 0.0f;
         for (unsigned k = 0; k < HRTF_NUM_TAPS && !any; k++) {
@@ -2746,6 +3028,5 @@ void mcpx_apu_vp_restore_hrtf(MCPXAPUState *d)
         }
         entries += any;
     }
-    nc_log("hakuX-native-state", "apu: %u 3D voices' HRTF filters set again (%u entries hold coefficients)", set,
-           entries);
+    nc_log("hakuX-native-state", "apu: %u HRTF entries hold coefficients", entries);
 }

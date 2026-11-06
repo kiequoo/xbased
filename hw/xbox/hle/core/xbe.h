@@ -17,7 +17,8 @@
 #define HLE_XBE_SEC_PRELOAD    0x02u
 #define HLE_XBE_SEC_EXECUTABLE 0x04u
 
-#define HLE_XBE_MAX_SECTIONS 256   /* Fable has 107 */
+#define HLE_XBE_MAX_SECTIONS 512   /* Fable has 107, Spikeout: Battle Street 398 (past 256 it was
+                                      refused as damaged); the kernel's has no limit */
 #define HLE_XBE_MAX_LIBS     48
 
 typedef struct HleXbeSection {

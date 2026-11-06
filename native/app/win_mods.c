@@ -438,8 +438,92 @@ static int widescreen_patches(FILE *out, int disc_fd, const WsPatch *w, const ch
     return hits;
 }
 
+/* FNV-1a 64 of a file (tools/db/build_db.py hashes the same way); false if
+ * it can't be read */
+static bool file_fnv1a64(const char *path, uint64_t *hash, uint64_t *size)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    uint64_t h = 0xCBF29CE484222325ull, n = 0;
+    unsigned char buf[4096];
+    size_t got;
+    while ((got = fread(buf, 1, sizeof(buf), f)) > 0) {
+        for (size_t i = 0; i < got; i++) {
+            h = (h ^ buf[i]) * 0x100000001B3ull;
+        }
+        n += got;
+    }
+    fclose(f);
+    *hash = h;
+    *size = n;
+    return true;
+}
+
+/* Windows' update unpacks the new package over the folder and deletes
+ * nothing, so a patch the database took away from a release (made for
+ * another release's executable: Grand Theft Auto: San Andreas's 60 FPS patch
+ * on its European Classics release crashed it while loading) would stay
+ * offered. The package lists those (mods/removed.txt: "<title id>/<file>
+ * <size> <FNV-1a 64>"); each is deleted while it is still that copy, never a
+ * file of the same name the user changed or put there, and its folder when
+ * that leaves it empty. */
+void nc_win_mods_cleanup(const char *exe_dir)
+{
+    static bool done;
+    if (done) {
+        return;
+    }
+    done = true;
+    char list[MAX_PATH * 2];
+    snprintf(list, sizeof(list), "%smods/removed.txt", exe_dir);
+    FILE *f = fopen(list, "r");
+    if (!f) {
+        return;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        if (!line[0] || line[0] == '#') {
+            continue;
+        }
+        /* the path may hold spaces: the size and hash are the last two words */
+        char *hs = strrchr(line, ' ');
+        if (!hs) {
+            continue;
+        }
+        *hs++ = 0;
+        char *ss = strrchr(line, ' ');
+        if (!ss) {
+            continue;
+        }
+        *ss++ = 0;
+        if (strstr(line, "..") || line[0] == '/' || line[0] == '\\' || strchr(line, ':')) {
+            continue;
+        }
+        const uint64_t want_hash = strtoull(hs, NULL, 16), want_size = strtoull(ss, NULL, 10);
+        char path[MAX_PATH * 2];
+        snprintf(path, sizeof(path), "%smods/%s", exe_dir, line);
+        uint64_t h, n;
+        if (!file_fnv1a64(path, &h, &n) || h != want_hash || n != want_size) {
+            continue;
+        }
+        if (SDL_RemovePath(path)) {
+            nc_log("hakuX-mods", "%s: a patch made for another release's executable, removed", line);
+            char *slash = strrchr(path, '/');
+            if (slash) {
+                *slash = 0;
+                SDL_RemovePath(path);   /* the folder, if that left it empty */
+            }
+        }
+    }
+    fclose(f);
+}
+
 bool nc_win_mods_prepare(const char *exe_dir, int disc_fd, char **opts, int nopts)
 {
+    nc_win_mods_cleanup(exe_dir);
     char key[32];
     if (disc_fd < 0 || !game_key(disc_fd, key, sizeof(key))) {
         return false;

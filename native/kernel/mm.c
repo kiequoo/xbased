@@ -30,7 +30,12 @@
 #define USER_HI   0x7FFE0000u
 #define VA_GRAIN  0x10000u
 #define MAX_REGIONS 4096
-#define MAX_CONTIG  4096
+/* Contiguous blocks: as many as RAM has pages (128 MiB's), so that only the
+ * memory runs out, as on the console. SNK vs. Capcom: SVC Chaos makes
+ * thousands of 1365-byte ones at boot: past 4096 every one failed with 10
+ * MiB free, and a disc read into a block it didn't get sent it back to the
+ * dashboard from the Neo Geo screen. */
+#define MAX_CONTIG  32768
 
 typedef struct Region {
     uint32_t base, size, protect;
@@ -402,7 +407,13 @@ static uint64_t NtFreeVirtualMemory(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* NtProtectVirtualMemory(BaseAddress, RegionSize, NewProtect, OldProtect). Guest
  * memory is flat here (no access checks), so the protection is recorded for
  * NtQueryVirtualMemory and the old one returned; the range rounds out to pages
- * as the kernel's does (JSRF protects its own pages). */
+ * as the kernel's does (JSRF protects its own pages). The code translated from
+ * the range goes: a title patching its code makes it writable, writes, and
+ * sets the protection back, and the translations of the old bytes would run
+ * on. Rainbow Six 3 points the C runtime's malloc, calloc and free at its own
+ * allocator that way at boot; malloc had run already, its old translation
+ * kept handing out the system heap's blocks, its free sent them to the
+ * allocator, and the first mission's load died on a block it never made. */
 static uint64_t NtProtectVirtualMemory(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
     uint32_t base = nc_vm_rd32(k->vm, a[0]);
@@ -425,6 +436,9 @@ static uint64_t NtProtectVirtualMemory(NcKernel *k, NcFrame *f, const uint32_t *
     nc_vm_wr32(k->vm, a[0], base);
     nc_vm_wr32(k->vm, a[1], size);
     nc_vm_wr32(k->vm, a[3], old);
+    if (k->cpu) {
+        nc_cpu_invalidate(k->cpu, base, size);
+    }
     static unsigned s_logged; /* JSRF flips a region's protection every frame */
     if (s_logged < 16) {
         nc_log("hakuX-native-mm", "protect %08x+%x %x (was %x)%s", base, size, a[2], old,

@@ -40,6 +40,7 @@ struct ApuField {
 #define DATA(s, m) {#m, F_DATA, offsetof(s, m), sizeof(((s *)0)->m), 1, NULL}
 #define OPT_DATA(s, m) {#m, F_DATA, offsetof(s, m), sizeof(((s *)0)->m), 1, NULL, true}
 #define STRUCT(s, m, n, t, desc) {#m, F_STRUCT, offsetof(s, m), sizeof(t), (n), &(desc)}
+#define OPT_STRUCT(s, m, n, t, desc) {#m, F_STRUCT, offsetof(s, m), sizeof(t), (n), &(desc), true}
 #define PTR(s, m, t, desc) {#m, F_PTR, offsetof(s, m), sizeof(t), 1, &(desc)}
 #define END {NULL, F_END, 0, 0, 0, NULL}
 
@@ -109,6 +110,36 @@ static const ApuField k_ssl_fields[] = {
 };
 static const ApuDesc k_ssl = {"mcpx_apu_voice_data", k_ssl_fields};
 
+/* A voice's processing state carried from frame to frame (vp.h
+ * MCPXAPUVoiceFilter): the resampler's input and cursor, the filters' state,
+ * the gains, pitch and filter frequencies the next frame ramps from, the
+ * LFOs and the HRTF filter. A state without it loads with each voice as a
+ * new voice's (mcpx_apu_vp_reset): one frame's fade in from silence. */
+static const ApuField k_filter_fields[] = {
+    DATA(MCPXAPUVoiceFilter, resample_buf),
+    DATA(MCPXAPUVoiceFilter, resample_buf_pos),
+    DATA(MCPXAPUVoiceFilter, interp),
+    DATA(MCPXAPUVoiceFilter, interp_idx),
+    DATA(MCPXAPUVoiceFilter, interp_pos),
+    DATA(MCPXAPUVoiceFilter, svf),
+    DATA(MCPXAPUVoiceFilter, peq),
+    DATA(MCPXAPUVoiceFilter, i3dl2),
+    DATA(MCPXAPUVoiceFilter, route_gain),
+    DATA(MCPXAPUVoiceFilter, pitch),
+    DATA(MCPXAPUVoiceFilter, dls2_f),
+    DATA(MCPXAPUVoiceFilter, peq_f),
+    DATA(MCPXAPUVoiceFilter, gains),
+    DATA(MCPXAPUVoiceFilter, pitched),
+    DATA(MCPXAPUVoiceFilter, dls2_set),
+    DATA(MCPXAPUVoiceFilter, peq_set),
+    DATA(MCPXAPUVoiceFilter, lfo_phase),
+    DATA(MCPXAPUVoiceFilter, lfo_wait),
+    DATA(MCPXAPUVoiceFilter, lfo_armed),
+    DATA(MCPXAPUVoiceFilter, hrtf),
+    END,
+};
+static const ApuDesc k_filter = {"mcpx_apu_voice_filter", k_filter_fields};
+
 static const ApuField k_apu_fields[] = {
     PTR(MCPXAPUState, gp.dsp, DSPState, k_dsp),
     DATA(MCPXAPUState, gp.regs),
@@ -128,6 +159,7 @@ static const ApuField k_apu_fields[] = {
      * (mcpx_apu_vp_restore_hrtf) */
     OPT_DATA(MCPXAPUState, vp.hrtf),
     OPT_DATA(MCPXAPUState, vp.hrir_sm),
+    OPT_STRUCT(MCPXAPUState, vp.filters, MCPX_HW_MAX_VOICES, MCPXAPUVoiceFilter, k_filter),
     END,
 };
 static const ApuDesc k_apu = {"mcpx-apu", k_apu_fields};

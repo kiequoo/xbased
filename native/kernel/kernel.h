@@ -377,6 +377,10 @@ void nc_ex_register(NcKernel *k);
 void nc_rtl_register(NcKernel *k);
 /* Room for len bytes of guest code in the kernel area (stubs), or 0. */
 uint32_t nc_kernel_code_alloc(NcKernel *k, uint32_t len);
+/* A guest stub for an xbdm.dll export a development build imports (the debug
+ * monitor of a development kit, absent here): its address, *name set, or 0
+ * for an export without one. */
+uint32_t nc_kernel_xbdm_stub(NcKernel *k, unsigned ordinal, const char **name);
 
 /* fixups.c: before the title runs, its library code that spins on emulated
  * hardware is pointed at the kernel (DirectSound's GP mailbox wait). */

@@ -1179,6 +1179,22 @@ static bool is_colour_rt(uint32_t rt_id)
     return rt && (rt->aspect & VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
+/* A linear stage whose own size (its IMAGE_RECT) is less than the target's
+ * on an axis: the target's top-left part, read at the stage's texel
+ * coordinates, not at the fragment's own pixel, so not by fbfetch (the copy
+ * before the draw serves it: hle_draw_snap_needed). Prince of Persia: The
+ * Two Thrones shrinks its 640 x 480 frame in place for its glow, each pass
+ * drawing a quarter of the last into the top-left corner of the same target
+ * and reading it as a 320 x 240 texture there at twice its coordinates.
+ * Read at their own pixels, the passes shrank nothing: the glow was the
+ * frame itself, added over it again, and the menus washed out to white. */
+static bool part_of_target(const HleCmdDraw *c, unsigned st, uint32_t rt_id)
+{
+    const HleVkSurf *rt = (c->tex_lin >> st & 1) ? hle_surf_get(rt_id) : NULL;
+    const uint32_t w = (c->tex_rect[st] >> 16) & 0x1FFF, h = c->tex_rect[st] & 0x1FFF;
+    return rt && w && h && (w < rt->d.w || h < rt->d.h);
+}
+
 /*
  * Fixed-function stages (the key's: from the cascade's first) whose texture
  * is the colour target the draw renders: they read its pixel (fbfetch), as
@@ -1196,7 +1212,7 @@ static unsigned ff_fb_stages(const HleCmdDraw *c, uint32_t rt_id)
     }
     unsigned first = s->rs[RS_POINTSPRITEENABLE] ? HLE_FF_SPRITE_STAGE : 0, m = 0;
     for (unsigned st = first; st < HLE_FF_STAGES && s->tss[st][TSS_COLOROP] > 1; st++) {
-        if (c->tex[st] == rt_id) {
+        if (c->tex[st] == rt_id && !part_of_target(c, st, rt_id)) {
             m |= 1u << (st - first);
         }
     }
@@ -1218,7 +1234,8 @@ unsigned hle_draw_fb_stages(const HleCmdDraw *c, uint32_t rt_id)
     unsigned m = 0;
     for (unsigned st = 0; st < HLE_TSS_STAGES; st++) {
         unsigned mode = (g_dr.st.rs[HLE_PS_TEXMODES] >> (5 * st)) & 0x1F;
-        if (c->tex[st] == rt_id && (mode == HLE_PST_PROJECT2D || mode == HLE_PST_PROJECT3D)) {
+        if (c->tex[st] == rt_id && (mode == HLE_PST_PROJECT2D || mode == HLE_PST_PROJECT3D) &&
+            !part_of_target(c, st, rt_id)) {
             m |= 1u << st;
         }
     }

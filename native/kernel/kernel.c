@@ -395,6 +395,43 @@ uint32_t nc_kernel_code_alloc(NcKernel *k, uint32_t len)
     return va;
 }
 
+/* xbdm.dll's exports a development build may import, as stubs: the debug
+ * monitor isn't here, and nothing ever talks to it. Each returns its value
+ * and pops its stdcall arguments. Only exports whose import a title was seen
+ * to make, its call read: StarCraft: Ghost's 2003 build registers an "XCAT"
+ * command processor (ordinal 30, a name and a callback, the callee popping
+ * them) at its first video, and called through the unresolved import it ran
+ * into the kernel's header and stopped. */
+static const struct {
+    uint16_t ordinal, arg_bytes;
+    uint32_t ret;
+    const char *name;
+} k_xbdm[] = {
+    { 30, 8, 0x02DA0000u, "DmRegisterCommandProcessor" },   /* XBDM_NOERR */
+};
+
+uint32_t nc_kernel_xbdm_stub(NcKernel *k, unsigned ordinal, const char **name)
+{
+    for (size_t i = 0; i < sizeof(k_xbdm) / sizeof(k_xbdm[0]); i++) {
+        if (k_xbdm[i].ordinal != ordinal) {
+            continue;
+        }
+        const uint32_t va = nc_kernel_code_alloc(k, 8);
+        uint8_t *p = va ? nc_vm_host(k->vm, va) : NULL;
+        if (!p) {
+            return 0;
+        }
+        p[0] = 0xB8;                                    /* mov eax, ret */
+        nc_wr32(p + 1, k_xbdm[i].ret);
+        p[5] = 0xC2;                                    /* ret arg_bytes */
+        p[6] = (uint8_t)k_xbdm[i].arg_bytes;
+        p[7] = (uint8_t)(k_xbdm[i].arg_bytes >> 8);
+        *name = k_xbdm[i].name;
+        return va;
+    }
+    return 0;
+}
+
 bool nc_kernel_init(NcKernel *k, NcVm *vm)
 {
     memset(k, 0, sizeof(*k));
@@ -403,6 +440,16 @@ bool nc_kernel_init(NcKernel *k, NcVm *vm)
         nc_log("hakuX-native", "kernel: physical 0x%x-0x%x taken", NC_KERNEL_PA,
                NC_KERNEL_PA + K_CLAIMED);
         return false;
+    }
+    /* A development kit's top 20 KiB stay out of every allocation: D3D's DMA
+     * objects end below them (limit 0x07FFAFFF, its every build's, the GPU's
+     * instance memory above), so a push buffer there runs past its object's
+     * end. Given the top of 128 MiB, StarCraft: Ghost's 2003 build's 2 MiB
+     * push buffer's last 16 KiB were past it: the decoder faulted there, the
+     * commands went unrun, and the title froze at its title screen. With 64
+     * MiB the range isn't RAM. */
+    if (vm->ram_size > NC_RAM_RETAIL) {
+        nc_vm_claim_phys(vm, vm->ram_size - 0x5000u, 0x5000u);
     }
     uint8_t *km = nc_vm_host(vm, NC_KERNEL_VA);
     memset(km, 0, K_CLAIMED);

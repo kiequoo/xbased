@@ -22,6 +22,7 @@
 #define XBE_SECTIONS     0x120
 #define XBE_TLS_DIR      0x12C
 #define XBE_STACK_COMMIT 0x130
+#define XBE_IMPORTS      0x15C   /* the imports from libraries other than the kernel */
 #define SEC_HDR_SIZE     0x38
 #define SEC_REFS         0x18
 
@@ -65,7 +66,7 @@ static bool xbe_read(const NcDisc *disc, const NcXbe *x, uint64_t off, void *buf
     return nc_disc_read(disc, &x->file, off, buf, len);
 }
 
-bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, const NcKernel *k, NcXbe *out)
+bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, NcKernel *k, NcXbe *out)
 {
     memset(out, 0, sizeof(*out));
     out->fd = -1;
@@ -161,6 +162,42 @@ bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, const NcKernel 
         }
         nc_vm_wr32(vm, t, target);
         out->thunks++;
+    }
+
+    /* A development build's imports from other libraries: {thunks, name}
+     * entries, zero-ended, each a table of ordinals like the kernel's. The
+     * debug monitor's (xbdm.dll) get stubs where there are some
+     * (nc_kernel_xbdm_stub); the rest stay as they are, told now. */
+    const uint32_t imp = nc_rd32(hdr + XBE_IMPORTS);
+    for (uint32_t e = imp; e && nc_vm_phys(vm, e) != UINT32_MAX && nc_vm_phys(vm, e + 7) != UINT32_MAX &&
+                           nc_vm_rd32(vm, e); e += 8) {
+        const uint32_t thunk = nc_vm_rd32(vm, e), name_va = nc_vm_rd32(vm, e + 4);
+        char lib[32] = "";
+        for (unsigned i = 0; i + 1 < sizeof(lib) && nc_vm_phys(vm, name_va + 2 * i + 1) != UINT32_MAX; i++) {
+            const uint16_t ch = (uint16_t)(nc_vm_rd32(vm, name_va + 2 * i) & 0xFFFF);
+            if (!ch) {
+                break;
+            }
+            lib[i] = ch < 0x80 ? (char)ch : '?';
+        }
+        const bool xbdm = !strcasecmp(lib, "xbdm.dll");
+        for (uint32_t t = thunk; nc_vm_phys(vm, t) != UINT32_MAX && nc_vm_phys(vm, t + 3) != UINT32_MAX; t += 4) {
+            const uint32_t v = nc_vm_rd32(vm, t);
+            if (!v) {
+                break;
+            }
+            const char *fn = NULL;
+            const uint32_t stub = xbdm && (v & 0x80000000u) ? nc_kernel_xbdm_stub(k, v & 0x7FFFFFFFu, &fn) : 0;
+            if (stub) {
+                nc_vm_wr32(vm, t, stub);
+                nc_log("hakuX-native-imports", "title %08x imports %s ordinal %u (%s): a stub, the debug "
+                       "monitor isn't here", x->title_id, lib, v & 0x7FFFFFFFu, fn);
+            } else {
+                nc_log("hakuX-native-imports", "title %08x imports %s %s%u, not here (a call to it stops "
+                       "the game)", x->title_id, lib, (v & 0x80000000u) ? "ordinal " : "name at ",
+                       (v & 0x80000000u) ? v & 0x7FFFFFFFu : v);
+            }
+        }
     }
 
     char imports[1024] = "", missing[1024] = "";

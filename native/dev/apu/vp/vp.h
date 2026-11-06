@@ -36,26 +36,50 @@ typedef struct MCPXAPUVPSSLData {
     int ssl_seg;
 } MCPXAPUVPSSLData;
 
+/* A voice's processing state carried from frame to frame. The fields from
+ * resample_buf to hrtf are saved in a savestate (state.c k_filter_fields);
+ * a state without them starts each voice as VOICE_ON does
+ * (voice_reset_filters). */
 typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
+    /* The resampler (vp.c voice_resample): the block of decoded input not
+     * yet read, and the 8-point interpolator's last eight input samples,
+     * each held at i and i + 8 so the window from interp_idx is contiguous.
+     * interp_pos is the cursor in 16.16: whole samples still to read before
+     * the next output, then the fraction between interp[3] and interp[4]. */
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
-    SRC_STATE *resampler;
-    sv_filter svf[2];
+    int32_t resample_buf_pos;
+    float interp[16][2];
+    int32_t interp_idx;
+    uint32_t interp_pos;
+    sv_filter svf[2];           /* DLS2 */
+    sv_filter peq[2];           /* ParaEQ */
+    float i3dl2[2];             /* the I3DL2's direct and room paths */
+    /* Each route's gain at the end of the last frame (1/16384 of the
+     * attenuation's times the envelope's 2048ths), the pitch, and the DLS2
+     * and ParaEQ frequency coefficients, which move from the last frame's
+     * values across the next; the flags say there is a last frame. */
+    float route_gain[8];
+    double pitch;
+    float dls2_f[2];
+    float peq_f[2];
+    bool gains;
+    bool pitched;
+    bool dls2_set;
+    bool peq_set;
+    /* the LFOs (A, F): their phase, the frames of delay left, and whether
+     * the delays were taken from the voice yet */
+    uint16_t lfo_phase[2];
+    uint16_t lfo_wait[2];
+    bool lfo_armed;
     HrtfFilter hrtf;
-    /* The voice table for voice_resample_callback (libsamplerate's callback
-     * signature cannot be extended). Set by voice_resample before
-     * src_callback_read; valid only for the duration of that synchronous
-     * call. */
-    uint8_t *cb_voice_cache;
     /* HAKUX_AUDIO_SKIP_MUTED plumbing. Declared unconditionally to avoid ABI
      * churn (2 bytes/voice); only read/written when the flag is enabled.
-     * cb_skip_decode: set by voice_resample before src_callback_read, consumed
-     *   inside voice_resample_callback -> voice_get_samples to null the per-
-     *   sample decode for a muted voice. Same synchronous-call lifetime
-     *   contract as cb_voice_cache above (a refactor caching it across calls
-     *   would break it).
+     * cb_skip_decode: set by voice_process before voice_resample, consumed
+     *   inside voice_fill_block -> voice_get_samples to null the per-sample
+     *   decode for a muted voice; valid only for that frame's resample.
      * muted_prev: this voice was muted (skipped) on the previous audible
-     *   evaluation; drives the SVF/HRTF state reset on the muted->audible
+     *   evaluation; drives the filter state reset on the muted->audible
      *   transition. */
     bool cb_skip_decode;
     bool muted_prev;
@@ -91,6 +115,9 @@ typedef struct VoiceWorkDispatch {
     VoiceWorker *workers;
     bool workers_should_exit;
     uint64_t workers_pending;
+    /* the bins a multipass voice reads this frame (voice_work_schedule): in
+     * the VP's own mix, the only bins the voices mix into */
+    uint32_t mp_bins;
     pthread_cond_t work_finished;
     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     VoiceWorkItem queue[MCPX_HW_MAX_VOICES];
@@ -106,9 +133,10 @@ typedef struct {
     MCPXAPUVPSSLData ssl[MCPX_HW_MAX_VOICES];
     uint8_t hrtf_headroom;
     uint8_t hrtf_submix[4];
-    /* the HRTF entries read as sign and magnitude (set_hrir_coeff_tar); 0
-     * in a savestate from before, its taps two's complement (converted
-     * as it loads: mcpx_apu_vp_restore_hrtf) */
+    /* the decode the HRTF entries' taps were stored in: 2 the sign-magnitude
+     * minifloat (set_hrir_coeff_tar), 1 sign and linear magnitude / 128,
+     * 0 (or a savestate without the field) two's complement / 128; earlier
+     * decodes are converted as a state loads (mcpx_apu_vp_restore_hrtf) */
     uint8_t hrir_sm;
     uint8_t submix_headroom[NUM_MIXBINS];
     float sample_buf[NUM_SAMPLES_PER_FRAME][2];

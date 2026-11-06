@@ -10,5 +10,8 @@
  * ones opts name on ("mod=<id>", "cheat=<name>"), handed to the core. False
  * when the disc has none. Before boot. */
 bool nc_win_mods_prepare(const char *exe_dir, int disc_fd, char **opts, int nopts);
+/* The database patches a newer package took away (exe_dir\mods\removed.txt)
+ * deleted where they're still the database's copy; once a run. */
+void nc_win_mods_cleanup(const char *exe_dir);
 
 #endif

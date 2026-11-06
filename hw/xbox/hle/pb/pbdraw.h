@@ -75,6 +75,9 @@ void hle_pbd_counts(uint64_t *clears, uint64_t *swaps, unsigned *objects,
  * follow (hle_pbd_blit). */
 bool hle_pbd_blit_images(uint32_t sbase, uint32_t sp, uint32_t dbase, uint32_t dp, uint32_t bpp,
                          uint32_t ix, uint32_t iy, uint32_t ox, uint32_t oy, uint32_t w, uint32_t h);
+/* The rows of the linear colour target at pa whose rows are pitch bytes
+ * apart (the one bound last), 0 if there is none (decode thread). */
+uint32_t hle_pbd_target_rows(uint32_t pa, uint32_t pitch);
 /* A copy of guest memory by the 2D engine (a blit, M2MF: rows of row bytes
  * from slo into dlo, sp / dp apart, which may be negative) (decode thread):
  * hle_pbd_copy_begin, 0 if the caller makes it now, else the value it was

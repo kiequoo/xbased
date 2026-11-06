@@ -12,7 +12,14 @@
 
 #include <math.h>
 
-#define flush_to_zero(x) x
+/* Hardware keeps filter values to 1/16 of a 24-bit sample, rounding halves
+ * up (measured: ringing DLS2 and ParaEQ responses match this to the bit
+ * across all 32 samples of a frame, where full precision missed most of them
+ * by a few units). */
+static inline float svf_round(float x)
+{
+    return floorf(x * 524288.0f + 0.5f) / 524288.0f;
+}
 
 // Constants to match filter types
 #define F_LP 1
@@ -21,71 +28,46 @@
 #define F_BR 4
 #define F_AP 5
 
-// Number of filter oversamples
-#define F_R 1
-
-/* Structure to hold parameters for SV filter */
-
+/* Structure to hold parameters for SV filter. Plain data (the output is
+ * chosen by type, not a pointer into the struct), so a voice's filters can be
+ * saved in a savestate. */
 typedef struct {
-    float f;     // 2.0*sin(PI*fs/(fc*r));
-    float q;     // 2.0*cos(pow(q, 0.1)*PI*0.5);
-    float qnrm;  // sqrt(m/2.0f+0.01f);
+    float f;     // frequency coefficient
+    float q;     // damping
     float h;     // high pass output
     float b;     // band pass output
     float l;     // low pass output
-    float p;     // peaking output (allpass with resonance)
-    float n;     // notch output
-    float *op;   // pointer to output value
+    int type;    // F_LP ...: the output run_svf returns
 } sv_filter;
 
-/* Store data in SVF struct, takes the sampling frequency, cutoff frequency
-   and Q, and fills in the structure passed */
-/*
-static inline void setup_svf(sv_filter *sv, float fs, float fc, float q, int t) {
-    sv->f = 2.0f * sin(M_PI * fc / (float)(fs * F_R));
-    sv->q = 2.0f * cos(pow(q, 0.1f) * M_PI * 0.5f);
-*/
 static inline void setup_svf(sv_filter *sv, float fc, float q, int t) {
     sv->f = fc;
     sv->q = q;
-    sv->qnrm = sqrt(sv->q/2.0+0.01);
-    switch(t) {
-    case F_LP:
-        sv->op = &(sv->l);
-        break;
-    case F_HP:
-        sv->op = &(sv->h);
-        break;
-    case F_BP:
-        sv->op = &(sv->b);
-        break;
-    case F_BR:
-        sv->op = &(sv->n);
-        break;
-    default:
-        sv->op = &(sv->p);
-    }
+    sv->type = t;
 }
 
-/* Run one sample through the SV filter. Filter is by andy@vellocet */
+/* Run one sample through the SV filter. Filter is by andy@vellocet. No input
+ * scaling or waveshaping: on hardware the filter is linear with unity
+ * passband gain at any resonance (a retail console's impulse responses at
+ * FC0 E000h, C000h and 8000h with FC1 8000h and 2000h match the plain
+ * filter, high then band then low). Each step is rounded as the hardware
+ * rounds it (svf_round). */
 static inline float run_svf(sv_filter *sv, float in) {
-    float out;
-    int i;
-    in = sv->qnrm * in ;
-    for (i=0; i < F_R; i++) {
-        // very slight waveshape for extra stability
-        sv->b = flush_to_zero(sv->b - sv->b * sv->b * sv->b * 0.001f);
-        // regular state variable code here
-        // the notch and peaking outputs are optional
-        sv->h = flush_to_zero(in - sv->l - sv->q * sv->b);
-        sv->b = sv->b + sv->f * sv->h;
-        sv->l = flush_to_zero(sv->l + sv->f * sv->b);
-        sv->n = sv->l + sv->h;
-        sv->p = sv->l - sv->h;
-        out = *(sv->op);
-        in = out;
+    sv->h = svf_round(in - sv->l - sv->q * sv->b);
+    sv->b = svf_round(sv->b + sv->f * sv->h);
+    sv->l = svf_round(sv->l + sv->f * sv->b);
+    switch (sv->type) {
+    case F_LP:
+        return sv->l;
+    case F_HP:
+        return sv->h;
+    case F_BP:
+        return sv->b;
+    case F_BR:
+        return sv->l + sv->h;
+    default:
+        return sv->l - sv->h;
     }
-    return out;
 }
 
 #endif

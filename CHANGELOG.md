@@ -1,5 +1,100 @@
 # xbased changelog
 
+## 1.0.36 (2026-11)
+
+### Fixes
+- Grand Theft Auto: San Andreas (European Classics release) crashed while
+  loading with its 60 FPS patch on. The shipped patches (60 FPS,
+  widescreen, 480p) were made for the USA releases and write bytes at fixed
+  places of the game's executable; given to other releases of the same game
+  they landed on other code (in San Andreas, half of a call). They now go
+  only to the USA release each one was made for: 45 copies on other
+  releases are gone, and an update deletes them from the mods folder at
+  start (only while they're unchanged, never a patch of your own).
+
+## 1.0.35 (2026-11)
+
+### Sound
+The voice processor now follows raddad772's measurements of the audio chip
+on a retail console (xemu pull request #3105):
+
+- 3D sound (HRTF): the filter taps are read as the chip's small floating
+  point numbers, so 3D voices no longer come out several times too loud and
+  lopsided between ears; the left and right ears go to their own routes, a
+  3D voice plays mono, and new HRTF settings blend in across one frame.
+- Voices are resampled with the chip's 8-point interpolation instead of a
+  linear one: cleaner highs, no aliasing.
+- Volume and pitch changes ramp across each frame instead of stepping (no
+  clicks or buzz on envelopes), with the chip's volume curve and envelope
+  timing.
+- The ParaEQ and I3DL2 filters and the voice LFOs (vibrato, tremolo) work;
+  the DLS2 filter has no extra input cut or distortion.
+- DirectSound submixes (multipass voices) are no longer up to 42 dB too
+  quiet, and a voice sharing a page number with an output buffer no longer
+  goes silent.
+- Savestates from earlier versions load; their voices fade back in over
+  one frame.
+
+## 1.0.34 (2026-11)
+
+### Fixes
+- Spikeout: Battle Street said its program was damaged and didn't start.
+  Its executable has 398 sections and the loader took no more than 256; it
+  now takes up to 512.
+- That error message said hakuX where it should say xbased.
+
+## 1.0.33 (2026-11)
+
+### Fixes
+- Rainbow Six 3 crashed back to the dashboard while loading the first
+  campaign mission. At boot it rewrites the C runtime's malloc, calloc and
+  free to use its own allocator, and malloc had already been translated, so
+  the old version kept handing out the system heap's memory while free sent
+  it to the game's allocator. Changing a range's protection (as a game does
+  before and after patching its code) now drops the code translated from
+  it.
+
+## 1.0.32 (2026-11)
+
+### Fixes
+- SNK vs. Capcom: SVC Chaos went back to the dashboard after the Neo Geo
+  screen. It makes thousands of small contiguous memory blocks at boot, and
+  past 4096 of them every allocation failed even with plenty of memory free,
+  so a disc read went into a block it never got. The kernel now holds as
+  many blocks as memory has pages, so only running out of memory fails, as
+  on the console.
+
+## 1.0.31 (2026-11)
+
+### Fixes
+- StarCraft: Ghost's 2003 build froze on its title screen with 128 MB of
+  console memory. D3D's push buffer went at the very top of memory, past
+  the end of the area the GPU reads commands from (D3D leaves the top 20 KB
+  of a development kit's 128 MB to the GPU), so its last commands never
+  ran. With 128 MB those 20 KB now stay out of every allocation, as on a
+  development kit.
+- Development builds that import the debug monitor (xbdm.dll) no longer
+  stop at the first call into it: its DmRegisterCommandProcessor is a stub
+  that reports success (StarCraft: Ghost's GhostR.xbe stopped at its first
+  video). Other xbdm imports are listed in the log.
+
+## 1.0.30 (2026-11)
+
+### Fixes
+- WWE WrestleMania 21 stayed on a black screen at boot. It copies its
+  1024 x 512 legal screen whole into its 640 x 480 front buffer, and the rows
+  past the buffer's end ran over the commands it had just sent the GPU (and
+  a page of its own code), so nothing after them ever ran. A copy whose rows
+  are wider than the render target it goes into now stops at the target's
+  edges, which leaves the target exactly as the console's copy does.
+- Prince of Persia: The Two Thrones' menus and gameplay were washed out to
+  a bright green and yellow haze. Its glow shrinks the frame in place,
+  drawing each smaller copy into the corner of the same target while it
+  reads the bigger one, and those reads were taken as each pixel reading
+  itself, so nothing shrank and the frame was added over itself. A draw now
+  reads its own target that way only where the texture is the target's
+  full size.
+
 ## 1.0.29 (2026-11)
 
 ### Fixes

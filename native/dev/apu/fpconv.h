@@ -65,7 +65,11 @@ static inline uint32_t float_to_24b(float value)
     } else if (scaled_value <= (-8.0 * 0x100000)) {
         int24 = -1 - 0x7fffff;
     } else {
-        int24 = lrint(scaled_value);
+        /* The VP rounds its mix to 24-bit samples with halves up, as its
+         * filters round their values: on a retail console an HRTF output of
+         * -3297702.5 was written as -3297702 (lrint, halves to even, agreed
+         * on only half of them). */
+        int24 = floor(scaled_value + 0.5);
     }
     return int24 & 0xffffff;
 }

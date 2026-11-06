@@ -53,4 +53,20 @@ static inline void mix_one_bin(float *dst, const float *src, float g) {
 #endif
 }
 
+/* The same with a gain per sample (a route's gain ramping across the
+ * frame, vp.c route_gain_ramp). */
+static inline void mix_one_bin_ramp(float *dst, const float *src, const float *g) {
+#if defined(__aarch64__)
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i += 4) {
+        float32x4_t d = vld1q_f32(dst + i);
+        d = vfmaq_f32(d, vld1q_f32(g + i), vld1q_f32(src + i));
+        vst1q_f32(dst + i, d);
+    }
+#else
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        dst[i] += g[i] * src[i];
+    }
+#endif
+}
+
 #endif /* HW_XBOX_MCPX_APU_VP_MIX_INLINE_H */

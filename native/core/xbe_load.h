@@ -30,7 +30,7 @@ typedef struct NcXbe {
 /* path: on the disc ("\default.xbe", or "\Device\CdRom0\..."), or on a hard
  * disk partition ("\Device\Harddisk0\Partition2\xboxdash.xbe": the host
  * file, kept open for XeLoadSection). */
-bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, const NcKernel *k, NcXbe *out);
+bool nc_xbe_load(NcVm *vm, const NcDisc *disc, const char *path, NcKernel *k, NcXbe *out);
 /* len bytes at off of the booted XBE's host file (fd, nc_xbe_load's), the
  * mods' patches of it over them ([$u\...]: a title update's). */
 bool nc_xbe_host_read(int fd, uint64_t off, void *buf, size_t len);

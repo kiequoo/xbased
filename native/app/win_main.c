@@ -744,7 +744,7 @@ static const char *pick_disc(void)
 }
 
 #ifndef XBASED_VERSION
-#define XBASED_VERSION "1.0.29"
+#define XBASED_VERSION "1.0.36"
 #endif
 #ifdef _WIN32
 #define NC_PLATFORM_NAME "Windows"
@@ -755,6 +755,7 @@ static const char *pick_disc(void)
 int main(int argc, char *argv[])
 {
     exe_dir();
+    nc_win_mods_cleanup(g_exe_dir);
     read_ini();
     g_ncfg_args = g_nargs;
     const char *disc = NULL;

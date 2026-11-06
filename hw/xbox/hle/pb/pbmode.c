@@ -524,10 +524,32 @@ static void blit(const uint32_t *r)
     const uint32_t *s = g_pb.s2d;
     const uint32_t bpp = k_bpp[s[0x300 >> 2] & 0xF];
     const uint32_t pin = r[0x300 >> 2], pout = r[0x304 >> 2], size = r[0x308 >> 2];
-    const uint32_t w = size & 0xFFFF, h = size >> 16, sp = s[0x304 >> 2] & 0xFFFF, dp = s[0x304 >> 2] >> 16;
+    uint32_t w = size & 0xFFFF, h = size >> 16;
+    const uint32_t sp = s[0x304 >> 2] & 0xFFFF, dp = s[0x304 >> 2] >> 16;
     const uint32_t sbase = (ctx_base(s[0x184 >> 2]) + s[0x308 >> 2]) & 0x07FFFFFFu;
     const uint32_t dbase = (ctx_base(s[0x188 >> 2]) + s[0x30C >> 2]) & 0x07FFFFFFu;
     const uint32_t ix = pin & 0xFFFF, iy = pin >> 16, ox = pout & 0xFFFF, oy = pout >> 16;
+    /* Rows wider than the destination's pitch, into a render target: as
+     * much as lands in it. Each row's spill past the target's width goes
+     * under the next row's start, which the next row then writes, so the
+     * target holds the blit's corner as wide and tall as it either way; the
+     * rest runs on past its end, over memory the console keeps elsewhere
+     * (its kernel puts code low, its contiguous blocks high) but this one
+     * may have moved pages into. WWE WrestleMania 21 blits its 1024 x 512
+     * legal screen whole into its 640 x 480 front buffer: the 31 rows past
+     * it went over the push buffer behind it (and a page of the title's code
+     * moved there), the commands read as black pixels, and the screen
+     * stayed black. */
+    const uint32_t trows = bpp && dp && (ox + w) * bpp > dp ? hle_pbd_target_rows(dbase, dp) : 0;
+    if (trows) {
+        static unsigned s_logged;
+        if (s_logged++ < 8) {
+            hle_log("hakuX-hle-pb", "blit %ux%u at %u,%u into the %ux%u target at %08x: clipped to it "
+                    "(first 8 logged)", w, h, ox, oy, dp / bpp, trows, dbase);
+        }
+        w = dp / bpp > ox ? MIN(w, dp / bpp - ox) : 0;
+        h = trows > oy ? MIN(h, trows - oy) : 0;
+    }
     const uint32_t row = w * bpp;
     if (!bpp || !w || !h || (h > 1 && (!sp || !dp)) || (uint64_t)row * h > (16u << 20)) {
         g_pb.copies_skipped++;
