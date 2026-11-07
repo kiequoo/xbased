@@ -18,20 +18,37 @@
 
 Upstream is `crazyriddler/xbased` (remote: `upstream`).
 
+**Always use `git merge` — never squash, rebase, or `cherry-pick --reset-author`.** Each upstream commit keeps its original author, date, and message; only the merge commit itself is ours.
+
+Before merging, preview what will conflict:
 ```bash
 git fetch upstream --no-tags
-git merge upstream/main
+git merge-tree --write-tree main upstream/main
+```
+
+Then merge and push:
+```bash
+git merge --no-ff upstream/main
+# resolve any conflicts (see below)
 git push origin main          # direct push — no PR for upstream syncs
 ```
 
-Resolve any conflicts (recurring one: `tools/release/package_linux.sh` — keep our `ARCH=${ARCH:-$(uname -m)}` line and take upstream's new `VERSION`), then push directly to `main`. No PR needed for upstream syncs.
-
-After syncing, retag if the upstream version bumped:
-
+After testing on the device, retag if the upstream version bumped:
 ```bash
 git tag v<version>
 git push origin v<version>    # triggers CI and GitHub release
 ```
+
+### Recurring conflict spots
+
+**`native/app/ui/dash.c` — `draw_button_glyph`**
+Our `ui.swapab` A/B–X/Y face-button swap (`which ^ 1`, drawing `k_col[gi]` / `k_pad[gi]`) conflicts with upstream changes to the glyph draw logic. **Always combine both sides, never choose one:**
+- Keep upstream's `which >= 4` wide-key branch for triggers/View button unchanged.
+- In the `else if (D.in.pad)` face-button branch, apply our swap: `const int gi = cfg_bool(&D.global, "ui.swapab", false) ? (which ^ 1) : which;` and use `k_col[gi]` / `k_pad[gi]`.
+- Keep the `static const char *const k_key[4]` declaration (upstream sometimes drops it; it's needed for the keyboard branch below).
+
+**`tools/release/package_linux.sh`**
+Keep our `ARCH=${ARCH:-$(uname -m)}` line and the `aarch64` references throughout; take upstream's `VERSION` default value. Upstream periodically hardens this to `x86_64` only — revert those changes.
 
 ## PR workflow
 
