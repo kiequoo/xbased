@@ -14,6 +14,7 @@
  * as patchoff (a savestate made with it on gets the disc's bytes back).
  */
 #include "native/app/win_mods.h"
+#include "native/app/mod_fit.h"
 #include "native/core/mods.h"
 #include "native/core/xdvdfs.h"
 
@@ -438,46 +439,20 @@ static int widescreen_patches(FILE *out, int disc_fd, const WsPatch *w, const ch
     return hits;
 }
 
-/* FNV-1a 64 of a file (tools/db/build_db.py hashes the same way); false if
- * it can't be read */
-static bool file_fnv1a64(const char *path, uint64_t *hash, uint64_t *size)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return false;
-    }
-    uint64_t h = 0xCBF29CE484222325ull, n = 0;
-    unsigned char buf[4096];
-    size_t got;
-    while ((got = fread(buf, 1, sizeof(buf), f)) > 0) {
-        for (size_t i = 0; i < got; i++) {
-            h = (h ^ buf[i]) * 0x100000001B3ull;
-        }
-        n += got;
-    }
-    fclose(f);
-    *hash = h;
-    *size = n;
-    return true;
-}
-
 /* Windows' update unpacks the new package over the folder and deletes
  * nothing, so a patch the database took away from a release (made for
  * another release's executable: Grand Theft Auto: San Andreas's 60 FPS patch
  * on its European Classics release crashed it while loading) would stay
- * offered. The package lists those (mods/removed.txt: "<title id>/<file>
- * <size> <FNV-1a 64>"); each is deleted while it is still that copy, never a
- * file of the same name the user changed or put there, and its folder when
- * that leaves it empty. */
-void nc_win_mods_cleanup(const char *exe_dir)
+ * offered; so would a cheat file it took away (one that patches without
+ * checking the build it was made for). The package lists those
+ * (mods/removed.txt, cheats/removed.txt: "<title id>/<file> <size> <FNV-1a
+ * 64>"); each is deleted while it is still that copy, never a file of the
+ * same name the user changed or put there, and its folder when that leaves
+ * it empty. */
+static void cleanup_list(const char *exe_dir, const char *kind, const char *what)
 {
-    static bool done;
-    if (done) {
-        return;
-    }
-    done = true;
     char list[MAX_PATH * 2];
-    snprintf(list, sizeof(list), "%smods/removed.txt", exe_dir);
+    snprintf(list, sizeof(list), "%s%s/removed.txt", exe_dir, kind);
     FILE *f = fopen(list, "r");
     if (!f) {
         return;
@@ -504,13 +479,13 @@ void nc_win_mods_cleanup(const char *exe_dir)
         }
         const uint64_t want_hash = strtoull(hs, NULL, 16), want_size = strtoull(ss, NULL, 10);
         char path[MAX_PATH * 2];
-        snprintf(path, sizeof(path), "%smods/%s", exe_dir, line);
+        snprintf(path, sizeof(path), "%s%s/%s", exe_dir, kind, line);
         uint64_t h, n;
-        if (!file_fnv1a64(path, &h, &n) || h != want_hash || n != want_size) {
+        if (!fit_file_hash(path, &h, &n) || h != want_hash || n != want_size) {
             continue;
         }
         if (SDL_RemovePath(path)) {
-            nc_log("hakuX-mods", "%s: a patch made for another release's executable, removed", line);
+            nc_log("hakuX-mods", "%s/%s: %s, removed", kind, line, what);
             char *slash = strrchr(path, '/');
             if (slash) {
                 *slash = 0;
@@ -519,6 +494,45 @@ void nc_win_mods_cleanup(const char *exe_dir)
         }
     }
     fclose(f);
+}
+
+void nc_win_mods_cleanup(const char *exe_dir)
+{
+    static bool done;
+    if (done) {
+        return;
+    }
+    done = true;
+    cleanup_list(exe_dir, "mods", "a patch made for another release's executable");
+    cleanup_list(exe_dir, "cheats", "a cheat that patches without checking the game's build");
+}
+
+bool nc_win_mods_ips_fits(const char *exe_dir, int disc_fd, const char *dir, const char *id, char *why, size_t wn)
+{
+    FitXbe x;
+    char rel[160], path[MAX_PATH * 2 + 16], db[MAX_PATH * 2];
+    if (!fit_read_xbe(disc_fd, &x)) {
+        snprintf(why, wn, "no default.xbe");
+        return false;
+    }
+    snprintf(rel, sizeof(rel), "%08X/%s.ips", x.title_id, id);
+    snprintf(path, sizeof(path), "%s/%s.ips", dir, id);
+    snprintf(db, sizeof(db), "%smods/%08X", exe_dir, x.title_id);
+    /* the database's patches were made and tested on the North American
+     * releases: on another region's executable, never; and on one that's
+     * sold there, only where they fit its code. The user's own are theirs. */
+    if (strcmp(dir, db) || !fit_db_patch(exe_dir, rel)) {
+        return true;
+    }
+    if (!(x.regions & FIT_REGION_NA)) {
+        snprintf(why, wn, "made for the North American release, and this executable isn't sold there");
+        return false;
+    }
+    size_t len = 0;
+    uint8_t *p = SDL_LoadFile(path, &len);
+    const bool ok = p && fit_ips_code(disc_fd, p, len, why, wn);
+    SDL_free(p);
+    return ok;
 }
 
 bool nc_win_mods_prepare(const char *exe_dir, int disc_fd, char **opts, int nopts)
@@ -575,6 +589,13 @@ bool nc_win_mods_prepare(const char *exe_dir, int disc_fd, char **opts, int nopt
         char path[MAX_PATH * 2 + 16];
         if (mods[i].ips) {
             snprintf(path, sizeof(path), "%s/%s.ips", mods[i].dir, mods[i].id);
+            char why[160] = "";
+            if (!nc_win_mods_ips_fits(exe_dir, disc_fd, mods[i].dir, mods[i].id, why, sizeof(why))) {
+                /* never applied: listed off (a savestate made with it on gets the disc's bytes back) */
+                ips_patches(out, disc_fd, path, mods[i].id, false);
+                nc_log("hakuX-mods", "%s patch %s.ips: not for this executable (%s), left off", key, mods[i].id, why);
+                continue;
+            }
             const int recs = ips_patches(out, disc_fd, path, mods[i].id, mods[i].on);
             nc_log("hakuX-mods", "%s patch %s.ips (%d records): %s", key, mods[i].id, recs,
                    mods[i].on ? "on" : "off (mod=<its name> turns it on)");

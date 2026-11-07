@@ -723,11 +723,19 @@ static uint64_t KePulseEvent(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* NtCreateEvent(EventHandle, ObjectAttributes, EventType, InitialState) */
 static uint64_t NtCreateEvent(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
+    char name[256];
+    uint32_t status;
+    if (nc_ob_attr_name(k, a[1], name, sizeof(name)) && nc_ob_create_named(k, a[1], name, NC_OB_EVENT, a[0], &status)) {
+        return status;
+    }
     uint32_t ev = nc_ob_create(k, NC_OB_EVENT, 0x10);
     if (!ev) {
         return NC_STATUS_INSUFFICIENT_RESOURCES;
     }
     init_header(k, ev, (uint8_t)a[2], 4, (int32_t)(a[3] & 0xff));
+    if (name[0]) {
+        nc_ob_name(k, ev, NC_OB_EVENT, name);
+    }
     nc_vm_wr32(k->vm, a[0], nc_ob_handle(k, ev, NC_OB_EVENT));
     return NC_STATUS_SUCCESS;
 }
@@ -815,12 +823,20 @@ static uint64_t KeReleaseSemaphore(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* NtCreateSemaphore(SemaphoreHandle, ObjectAttributes, InitialCount, MaximumCount) */
 static uint64_t NtCreateSemaphore(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
+    char name[256];
+    uint32_t status;
+    if (nc_ob_attr_name(k, a[1], name, sizeof(name)) && nc_ob_create_named(k, a[1], name, NC_OB_SEMAPHORE, a[0], &status)) {
+        return status;
+    }
     uint32_t sem = nc_ob_create(k, NC_OB_SEMAPHORE, 0x14);
     if (!sem) {
         return NC_STATUS_INSUFFICIENT_RESOURCES;
     }
     init_header(k, sem, OBJ_SEMAPHORE, 5, (int32_t)a[2]);
     nc_vm_wr32(k->vm, sem + SEMAPHORE_LIMIT, a[3]);
+    if (name[0]) {
+        nc_ob_name(k, sem, NC_OB_SEMAPHORE, name);
+    }
     nc_vm_wr32(k->vm, a[0], nc_ob_handle(k, sem, NC_OB_SEMAPHORE));
     return NC_STATUS_SUCCESS;
 }
@@ -873,11 +889,19 @@ static uint64_t KeReleaseMutant(NcKernel *k, NcFrame *f, const uint32_t *a)
 /* NtCreateMutant(MutantHandle, ObjectAttributes, InitialOwner) */
 static uint64_t NtCreateMutant(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
+    char name[256];
+    uint32_t status;
+    if (nc_ob_attr_name(k, a[1], name, sizeof(name)) && nc_ob_create_named(k, a[1], name, NC_OB_MUTANT, a[0], &status)) {
+        return status;
+    }
     uint32_t m = nc_ob_create(k, NC_OB_MUTANT, 0x20);
     if (!m) {
         return NC_STATUS_INSUFFICIENT_RESOURCES;
     }
     init_mutant(k, m, a[2] & 0xff);
+    if (name[0]) {
+        nc_ob_name(k, m, NC_OB_MUTANT, name);
+    }
     nc_vm_wr32(k->vm, a[0], nc_ob_handle(k, m, NC_OB_MUTANT));
     return NC_STATUS_SUCCESS;
 }
@@ -1161,7 +1185,7 @@ static uint64_t KeDelayExecutionThread(NcKernel *k, NcFrame *f, const uint32_t *
 /* NtYieldExecution() */
 static uint64_t NtYieldExecution(NcKernel *k, NcFrame *f, const uint32_t *a)
 {
-    nc_ps_yield(k);         /* behind the ready threads of its priority */
+    nc_ps_yield(k);         /* to any ready thread, a lower priority one too */
     return NC_STATUS_SUCCESS;
 }
 

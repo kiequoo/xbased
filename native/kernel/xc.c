@@ -7,6 +7,7 @@
  * padding), bitlen 0x08, datalen 0x0C, pubexp 0x10, modulus at 0x14
  * (little-endian). Numbers in XcModExp and signatures are little-endian too.
  */
+#include "native/kernel/disc_key.h"
 #include "native/kernel/kernel.h"
 #include "native/kernel/xc_crypto.h"
 
@@ -214,6 +215,66 @@ static uint64_t XcVerifyPKCS1Signature(NcKernel *k, NcFrame *f, const uint32_t *
     nc_log("hakuX-native", "xc: PKCS1 verify: %s (block type %s, digest %s)", fwd || rev ? "ok" : "FAILED",
            padded ? "1" : "?", fwd ? "big-endian" : rev ? "little-endian" : "no match");
     return fwd || rev;
+}
+
+/* ------------------------------------------------- the discs' security sector */
+
+/* The kernel's public key (XePublicKeyData, 0x11C bytes): a BSAFE key,
+ * "RSA1", its length with padding (0x108), 2048 bits, 255 bytes of data,
+ * the exponent, the modulus. xbased's own (disc_key.h). */
+void nc_xc_public_key(uint8_t *p)
+{
+    memset(p, 0, 0x11C);
+    nc_wr32(p, 0x31415352u);
+    nc_wr32(p + 4, 0x108);
+    nc_wr32(p + 8, 2048);
+    nc_wr32(p + 12, 255);
+    nc_wr32(p + 16, 65537);
+    memcpy(p + 0x14, k_ss_n, sizeof(k_ss_n));
+}
+
+/* The disc's security sector as READ DVD STRUCTURE returns it (address
+ * FF02FDFF, layer FE: 0x664 bytes, a 4-byte header first). A disc image has
+ * none (the Xbox's are on the disc's lead-in, outside the image), so the
+ * drive makes one that passes the titles' own check, XAPI's for a title
+ * whose certificate's security flags ask for it (Crimson Skies: High Road
+ * to Revenge, which went back to the dashboard on zeros): the certificate's
+ * time stamp at +0x4AB, the SHA-1 of the length (0x4CB) and the 0x4CB bytes
+ * from +4 at +0x4CF, and the PKCS #1 signature of that digest under the
+ * kernel's public key at +0x4E3. */
+bool nc_xc_security_sector(NcKernel *k, uint8_t *d, uint32_t n)
+{
+    if (n < 0x4E3 + 256) {
+        return false;
+    }
+    memset(d, 0, n);
+    d[0] = (uint8_t)((n - 2) >> 8);                 /* the structure's length past itself, big-endian */
+    d[1] = (uint8_t)(n - 2);
+    const uint32_t cert = nc_vm_rd32(k->vm, 0x10118);
+    nc_wr32(d + 0x4AB, nc_vm_rd32(k->vm, cert + 4));
+    uint8_t len[4];
+    nc_wr32(len, 0x4CB);
+    NcSha1 s;
+    nc_sha1_init(&s);
+    nc_sha1_update(&s, len, 4);
+    nc_sha1_update(&s, d + 4, 0x4CB);
+    nc_sha1_final(&s, d + 0x4CF);
+    /* 00 01 FF..FF 00 digest, read as the little-endian number it is */
+    uint8_t be[256];
+    be[0] = 0;
+    be[1] = 1;
+    memset(be + 2, 0xFF, sizeof(be) - 23);
+    be[sizeof(be) - 21] = 0;
+    memcpy(be + sizeof(be) - 20, d + 0x4CF, 20);
+    uint32_t m[64], sig[64];
+    for (unsigned i = 0; i < 256; i++) {
+        ((uint8_t *)m)[i] = be[255 - i];
+    }
+    if (!nc_modexp(sig, m, k_ss_d, k_ss_n, 64)) {
+        return false;
+    }
+    memcpy(d + 0x4E3, sig, sizeof(sig));
+    return true;
 }
 
 /* XcCryptService / XcUpdateCrypto: no replaceable crypto vector. */

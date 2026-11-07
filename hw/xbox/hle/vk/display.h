@@ -60,5 +60,9 @@ uint32_t hle_disp_gamma_seq(void);
 /* The front frame's generation and swap id, without taking it (the
  * presenter's look for a new frame); false: none. */
 bool hle_disp_front(uint32_t *gen, uint32_t *swap_id);
+/* Frames made front so far, and a wait of up to ms for one more than seen
+ * (true: one came). The presenter's, to show a frame as it comes. */
+uint32_t hle_disp_fronts(void);
+bool hle_disp_wait_front(uint32_t seen, int ms);
 
 #endif

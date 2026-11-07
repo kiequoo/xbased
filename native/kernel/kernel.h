@@ -124,7 +124,15 @@ typedef struct NcSeh {
     uint32_t nested;         /* dispatch: the frame a nested raise came from */
     uint32_t target;         /* unwind: TargetFrame */
 } NcSeh;
-#define NC_MAX_SEH 8
+/* Levels a thread may have in progress at once. NT has no limit but the
+ * stack. Unreal Engine 2 titles (XIII) catch and rethrow in each guarded
+ * function an error passes through, every rethrow inside the catch block of
+ * the last, its dispatch still on the stack: a failed package lookup at boot
+ * went 9 deep, past the 8 kept before, and the core stopped there (a black
+ * screen). The first NC_SEH_STORED are NcThread.seh (THRD v1), the rest
+ * seh_more (THRD v4). */
+#define NC_MAX_SEH 64
+#define NC_SEH_STORED 8
 
 typedef struct NcThread {
     enum NcThreadState state;
@@ -151,7 +159,8 @@ typedef struct NcThread {
     NcApcChain apc;          /* the chain running (apc.in_apc) */
     NcApcChain apc_outer[NC_MAX_APC_NEST]; /* chains an alertable wait in an APC interrupted */
     unsigned apc_nest;
-    NcSeh seh[NC_MAX_SEH];
+    NcSeh seh[NC_SEH_STORED];             /* seh.c level(): the first ones */
+    NcSeh seh_more[NC_MAX_SEH - NC_SEH_STORED]; /* ... and the deeper ones */
     unsigned nseh;
     bool fresh;              /* ctx was just set up (an ISR or DPC entry): the
                                 running frame must not be saved over it */
@@ -270,6 +279,9 @@ struct NcKernel {
     uint8_t isr_saved_irql;
     NcThread *isr_interrupted; /* the thread an ISR interrupted */
     NcThread *resume_first;    /* resumes before anything else (was above DISPATCH_LEVEL) */
+    /* NtYieldExecution to a lower priority thread (nc_ps_yield): yield_from
+     * stays out of the scheduler's pick while yield_to runs its quantum. */
+    NcThread *yield_from, *yield_to;
     bool force_switch;         /* switch threads even though the IRQL is raised (ISR entry) */
     uint64_t interrupts;
 
@@ -338,6 +350,15 @@ uint32_t nc_ob_handle(NcKernel *k, uint32_t object, enum NcObType type);
 uint32_t nc_ob_lookup(NcKernel *k, uint32_t handle, enum NcObType *type);
 bool nc_ob_close(NcKernel *k, uint32_t handle);
 void nc_ob_register(NcKernel *k);
+/* Named objects (ob.c): an OBJECT_ATTRIBUTES' name (its length; "" none),
+ * a new object's name kept, and a create of a name that exists: true with
+ * the status (OBJ_OPENIF: a handle to it, STATUS_OBJECT_NAME_EXISTS). */
+size_t nc_ob_attr_name(NcKernel *k, uint32_t attrs, char *out, size_t n);
+void nc_ob_name(NcKernel *k, uint32_t object, enum NcObType type, const char *name);
+/* ... and dropped with the object's last handle */
+void nc_ob_unname(NcKernel *k, uint32_t object);
+bool nc_ob_create_named(NcKernel *k, uint32_t attrs, const char *name, enum NcObType type, uint32_t handle_out,
+                        uint32_t *status);
 
 void nc_ps_register(NcKernel *k);
 NcThread *nc_ps_thread_of(NcKernel *k, uint32_t ethread);
@@ -410,6 +431,9 @@ void nc_kernel_set_video(int64_t flags, int av_pack);
  * 7 Korean, 8 Chinese (traditional), 9 Portuguese. Before the title starts;
  * any other value keeps the stored one. */
 void nc_kernel_set_language(int language);
+/* ... set for the game itself: kept on a disc whose folders seem to lack it
+ * (otherwise such a disc plays in English) */
+void nc_kernel_set_language_fixed(bool fixed);
 /* ex.c: the console's audio setting (XC_AUDIO_FLAGS): stereo, or Dolby
  * Digital on (the games mix six channels). Before the title starts. */
 void nc_kernel_set_audio(bool surround);
@@ -593,6 +617,11 @@ void nc_dpc_return(NcKernel *k);
 void nc_io_register(NcKernel *k);
 /* xc.c: crypto exports. */
 void nc_xc_register(NcKernel *k);
+/* ... the kernel's public key (XePublicKeyData, 0x11C bytes), xbased's own */
+void nc_xc_public_key(uint8_t *p);
+/* ... the disc's security sector the DVD drive hands out (READ DVD
+ * STRUCTURE, n bytes), signed under that key; false if n is too short */
+bool nc_xc_security_sector(NcKernel *k, uint8_t *d, uint32_t n);
 /* Where the hard disk's partitions live on the host (PartitionN under it). */
 void nc_io_set_hdd_root(const char *path);
 const char *nc_io_hdd_root(void);

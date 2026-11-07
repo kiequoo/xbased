@@ -361,6 +361,35 @@ void nc_ps_yield(NcKernel *k)
         if (k->current->boost) {
             k->current->boost--;
         }
+        /* With none of its priority or above ready, NT's NtYieldExecution
+         * gives the CPU to the highest priority ready thread below it
+         * (KiFindReadyThread's lowest priority is 1), and that thread keeps
+         * it until it waits or its quantum ends. Here the yielding thread
+         * got it straight back: FIFA World Cup 2006's main thread yields
+         * until the cache worker it started a step below its own priority
+         * reaches a checkpoint, and with the cache from an earlier boot to
+         * check, the worker was mid-work when asked: the game froze on its
+         * first frame, two million yields a second. (Sleep(0) and polls
+         * give way only to their priority and above, as NT's do.) */
+        NcThread *const cur = k->current;
+        NcThread *low = NULL;
+        for (unsigned i = 0; i < k->threads_hi; i++) {
+            NcThread *t = &k->threads[i];
+            if (t == cur || t->state != NC_T_READY || t->suspend || t == k->isr_thread || t == k->dpc_thread) {
+                continue;
+            }
+            if (nc_thread_prio(t) >= nc_thread_prio(cur)) {
+                low = NULL;     /* one of its own priority or above: the usual turn */
+                break;
+            }
+            if (!low || nc_thread_prio(t) > nc_thread_prio(low)) {
+                low = t;
+            }
+        }
+        if (low) {
+            k->yield_from = cur;
+            k->yield_to = low;
+        }
     }
     k->resched = true;
 }
@@ -413,6 +442,12 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
 
     k->force_switch = false;
 
+    /* A yield to a lower priority thread lasts while that thread runs: its
+     * wait or its quantum's end gives the CPU back. */
+    if (k->yield_from && cur == k->yield_to && (cur->state != NC_T_READY || cur->slice_used_ns == 0)) {
+        k->yield_from = k->yield_to = NULL;
+    }
+
     /* Code an ISR interrupted above DISPATCH_LEVEL continues first. Then the
      * highest priority ready thread, round-robin after the current one. When
      * every thread waits, the guest CPU idles until the next timeout, timer
@@ -435,7 +470,7 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
         } else {
             for (unsigned n = 0; n < NC_MAX_THREADS; n++) {
                 NcThread *t = &k->threads[(start + n) % NC_MAX_THREADS];
-                if (t->state != NC_T_READY || t->suspend) {
+                if (t->state != NC_T_READY || t->suspend || t == k->yield_from) {
                     continue;
                 }
                 if (!t->ready_seq) {
@@ -449,6 +484,10 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
         }
         if (next) {
             break;
+        }
+        if (k->yield_from) {
+            k->yield_from = k->yield_to = NULL;     /* nothing else to run: the yielding thread */
+            continue;
         }
         /* Idle. With no timeout pending only an interrupt can wake a thread:
          * give up after a while without one. Paused meanwhile, here it
@@ -468,6 +507,9 @@ void nc_ps_schedule(NcKernel *k, NcFrame *f)
     }
     if (next == k->resume_first) {
         k->resume_first = NULL;
+    }
+    if (k->yield_from && next != k->yield_to && next != k->isr_thread && next != k->dpc_thread) {
+        k->yield_from = k->yield_to = NULL;         /* a higher priority thread came first */
     }
     if (next != cur) {
         g_nc_sched.switches++;
@@ -552,9 +594,9 @@ static uint64_t PsCreateSystemThreadEx(NcKernel *k, NcFrame *f, const uint32_t *
     }
     t->state = NC_T_READY;
     t->suspend = (a[7] & 0xff) ? 1 : 0;
-    nc_log("hakuX-native", "ps: thread %u created: start %08x (%s), stack %08x-%08x, tls %u%s", t->id,
+    nc_log("hakuX-native", "ps: thread %u created: start %08x (%s), stack %08x-%08x, tls %u%s, handle %x", t->id,
            a[5], a[9] ? "via system routine" : "direct", t->stack_limit, t->stack_base, a[3],
-           t->suspend ? ", suspended" : "");
+           t->suspend ? ", suspended" : "", h);
     return NC_STATUS_SUCCESS;
 }
 

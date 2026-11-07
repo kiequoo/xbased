@@ -4,12 +4,14 @@
 set(NC_APP_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/app/win_main.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/win_mods.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/app/mod_fit.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/win_auto.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/present.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/vsync.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/ui.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/i18n.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/config.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/console_cfg.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/xbox_data.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/library.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/input_map.c"
@@ -17,6 +19,8 @@ set(NC_APP_SOURCES
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/dash.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/dash_settings.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/dash_memory.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/dash_browse.c"
+  "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/dash_find.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/xemu_import.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/update.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/app/ui/shortcut.c"
@@ -26,7 +30,7 @@ if(WIN32)
   add_executable(hakux WIN32 ${NC_APP_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/app/win/xbased.rc")
   # the linker's map: the profile's offsets resolved where there is no debug info (HAKUX_PROF)
   target_link_options(hakux PRIVATE "-Wl,-Map=$<TARGET_FILE_DIR:hakux>/xbased.map")
-  target_link_libraries(hakux PRIVATE ole32 uuid shell32)   # the desktop shortcuts (app/ui/shortcut.c)
+  target_link_libraries(hakux PRIVATE ole32 uuid shell32 mpr)   # the desktop shortcuts (app/ui/shortcut.c); mpr: a network drive's share (dash_browse.c)
 else()
   add_executable(hakux ${NC_APP_SOURCES})
 endif()

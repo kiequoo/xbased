@@ -1,7 +1,9 @@
 /*
  * hakuX front end — the dashboard's drawing (ui.c): text in the bundled
  * font with the system's CJK fonts behind it, shapes, the console's green
- * theme, over an SDL_Renderer (Direct3D on Windows, OpenGL/Vulkan on Linux).
+ * theme, over an SDL_Renderer (Direct3D on Windows, OpenGL/Vulkan on Linux),
+ * or, in a game's process, as the overlay its own presenter composites over
+ * the picture (ui_init_overlay: the window stays the presenter's).
  */
 #ifndef NATIVE_APP_UI_UI_H
 #define NATIVE_APP_UI_UI_H
@@ -11,6 +13,8 @@
 #include <stdint.h>
 
 typedef struct { uint8_t r, g, b, a; } UiColor;
+/* A texture of the interface's (the renderer's, or the overlay's). */
+typedef struct UiTex UiTex;
 
 /* The theme: the original Xbox dashboard's greens on black. */
 #define UI_GREEN      ((UiColor){0x8C, 0xF0, 0x2A, 0xFF})
@@ -36,12 +40,28 @@ enum { UI_ALIGN_LEFT = 0, UI_ALIGN_CENTER = 1, UI_ALIGN_RIGHT = 2 };
 /* Up and down: the renderer for win, the fonts from font_dir (Play) and the
  * system's CJK fonts. */
 bool ui_init(SDL_Window *win, const char *font_dir);
+/* Or as a game's overlay: what is drawn becomes the presenter's overlay
+ * (hw/xbox/hle/vk/swapchain.h) at ui_end, which then calls present (the
+ * window's refresh); size gives the window's pixels. */
+bool ui_init_overlay(const char *font_dir, void (*present)(void), void (*size)(int *w, int *h));
+bool ui_is_overlay(void);
 void ui_shutdown(void);
 SDL_Renderer *ui_renderer(void);
 /* The frame: its size (pixels) and scale (1 at 720 lines: sizes are given
  * in 720p units and scaled), then drawing, then ui_end presents. */
 void ui_begin(void);
 void ui_end(void);
+/* The overlay's frame drawn so far set as the presenter's, without
+ * presenting (the window's loop presents); cover: it draws the whole
+ * window. ui_overlay_off: none any more. */
+void ui_overlay_submit(bool cover);
+void ui_overlay_off(void);
+/* The next ui_end's overlay covers the window (each frame's own). */
+void ui_cover(bool on);
+/* Everything drawn from now on faded to a (1: as given). */
+void ui_set_alpha(float a);
+/* A picture of the frame being drawn, to path (a BMP), as it is shown. */
+void ui_shot(const char *path);
 float ui_w(void);   /* in 720p units */
 float ui_h(void);
 float ui_scale(void);
@@ -64,17 +84,32 @@ void ui_glow(float cx, float cy, float r, UiColor c);
 void ui_circle(float cx, float cy, float r, UiColor c);
 void ui_ring(float cx, float cy, float rx, float ry, float rot, float t, UiColor c);
 /* An image (texture) fitted into the box, keeping its shape. */
-void ui_image(SDL_Texture *t, float x, float y, float w, float h, float alpha);
-SDL_Texture *ui_texture_rgba(const uint8_t *rgba, int w, int h);
+void ui_image(UiTex *t, float x, float y, float w, float h, float alpha);
+UiTex *ui_texture_rgba(const uint8_t *rgba, int w, int h);
+UiTex *ui_texture_surface(SDL_Surface *s);
+void ui_texture_free(UiTex *t);
+void ui_texture_size(const UiTex *t, float *w, float *h);
+/* A texture over the whole window, its colour modulated by c. */
+void ui_fill(UiTex *t, UiColor c);
+/* The game's picture under the overlay, as the window would show it, or
+ * that blurred (overlay only, while covering: NULL otherwise). */
+UiTex *ui_scene(bool blurred);
 void ui_clip(float x, float y, float w, float h);
 void ui_unclip(void);
 
 /* Layers: drawing into a transparent texture the window's size (a screen's
  * foreground), then that texture shown turned about the vertical axis
  * (angle, radians: 0 flat), pushed back (depth, in widths) and faded. */
-SDL_Texture *ui_layer_begin(SDL_Texture *layer);
+UiTex *ui_layer_begin(UiTex *layer);
 void ui_layer_end(void);
-void ui_layer_draw3d(SDL_Texture *layer, float angle, float depth, float alpha);
+void ui_layer_draw3d(UiTex *layer, float angle, float depth, float alpha);
+
+/* The transitions, over the whole window: t's picture breaking into
+ * shards that fly at the viewer, a flash at the break, black behind (k 0
+ * whole .. 1 gone); and the other way in, t's picture rushing in out of a
+ * flash of colour from (k 0 .. 1 settled). */
+void ui_fx_shatter(UiTex *t, float k);
+void ui_fx_flash_in(UiTex *t, float k, UiColor from);
 
 /* The console's animated backdrop: a green fog and drifting light. */
 void ui_backdrop(float intensity);

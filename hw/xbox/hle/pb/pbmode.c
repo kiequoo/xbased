@@ -958,6 +958,12 @@ static void consume_pass(void)
          * forever (it ends in a jump to itself) instead of the jump at 0 to
          * the new ring, and CreateDevice never saw the GPU idle. */
         g_pb.synced = false;
+        /* Idle all the same: the memory a title keeps for the next one is
+         * written back here. Test Drive tears its channel down before it
+         * reboots into the race, and the frame it kept for the loading
+         * screen went over as the memory held it (black), the GPU's image
+         * of it never written back. */
+        hle_pbd_idle();
         return;
     }
     HlePusher *p = &g_pb.p;

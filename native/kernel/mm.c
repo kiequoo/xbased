@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define MEM_COMMIT   0x1000u
@@ -575,7 +576,7 @@ static void log_phys_map(NcKernel *k)
             snprintf(what, sizeof(what), "C%08x.. (%u blocks) by %08x", g_contig[block].va, blocks, g_contig[block].ra);
         } else if (kind == 'C') {
             snprintf(what, sizeof(what), "C%08x by %08x", g_contig[block].va, g_contig[block].ra);
-        } else if (kind == 'P' || kind == 'N') {
+        } else if (kind == 'P' || kind == 'N' || (kind == 'K' && vm->rmap[p])) {
             const Region *r = region_at(vm->rmap[p]);
             snprintf(what, sizeof(what), "%c va %08x%s", kind, vm->rmap[p], r && r->image ? " image" : "");
         } else {
@@ -589,6 +590,109 @@ static void log_phys_map(NcKernel *k)
         p = q;
     }
     nc_log("hakuX-native", "%s", line);
+}
+
+/* The last title's RAM after a quick reboot (a relaunch into another XBE).
+ * The console keeps RAM as it is over one, and a contiguous block isn't
+ * cleared: it holds what the last title left there. Test Drive's race
+ * executable sets up its frame buffers where its menu's were and draws the
+ * Pong of its loading screen over the menu's last frame (a TV set) without
+ * clearing them: here they started black, the TV gone. The core boots
+ * afresh for each XBE, so at the reboot the pages with anything in them go
+ * to a file (the GPU's images over them written back first), and the
+ * first contiguous block over each of them, the next boot, gets them back
+ * instead of zeros; the rest is cleared as before. */
+static uint8_t *g_stale;        /* RAM as the last title left it, or NULL */
+static uint8_t *g_stale_page;   /* per page: still the last title's */
+static uint32_t g_stale_left;   /* pages of it not taken yet */
+
+#define STALE_MAGIC 0x4C415453u /* "STAL" */
+
+static void stale_file(char *out, size_t n)
+{
+    snprintf(out, n, "%s/../stale.bin", nc_io_hdd_root());
+}
+
+static void stale_fill(NcKernel *k, uint32_t pa, uint32_t size)
+{
+    bool any = false;
+    for (uint32_t o = 0; o < size; o += NC_PAGE) {
+        const uint32_t p = (pa + o) / NC_PAGE, n = size - o < NC_PAGE ? size - o : NC_PAGE;
+        if (g_stale && g_stale_page[p]) {
+            memcpy(k->vm->ram + pa + o, g_stale + pa + o, n);
+            g_stale_page[p] = 0;
+            g_stale_left--;
+            any = true;
+        } else {
+            memset(k->vm->ram + pa + o, 0, n);
+        }
+    }
+    if (any && nc_vm_dma.wrote) {
+        nc_vm_dma.wrote(pa, size);      /* the GPU's copies of it are old */
+    }
+    if (g_stale && !g_stale_left) {
+        free(g_stale);
+        free(g_stale_page);
+        g_stale = g_stale_page = NULL;
+    }
+}
+
+static void stale_save(NcKernel *k)
+{
+    char path[512];
+    stale_file(path, sizeof(path));
+    FILE *fp = fopen(path, "wb");
+    const uint32_t pages = k->vm->ram_size / NC_PAGE;
+    uint32_t hdr[3] = {STALE_MAGIC, k->vm->ram_size, 0};
+    bool ok = fp && fwrite(hdr, sizeof(hdr), 1, fp) == 1;
+    for (uint32_t p = 0; ok && p < pages; p++) {
+        const uint64_t *w = (const uint64_t *)(k->vm->ram + (size_t)p * NC_PAGE);
+        unsigned i = 0;
+        while (i < NC_PAGE / 8 && !w[i]) {
+            i++;
+        }
+        if (i < NC_PAGE / 8) {
+            ok = fwrite(&p, sizeof(p), 1, fp) == 1 && fwrite(w, NC_PAGE, 1, fp) == 1;
+            hdr[2]++;
+        }
+    }
+    ok = ok && fseek(fp, 0, SEEK_SET) == 0 && fwrite(hdr, sizeof(hdr), 1, fp) == 1;
+    if (fp) {
+        fclose(fp);
+    }
+    if (!ok) {
+        unlink(path);
+    }
+    nc_log("hakuX-native-mm", "the last title's RAM: %u KiB in use%s", hdr[2] * (NC_PAGE >> 10),
+           ok ? ", for the next title" : ": not written");
+}
+
+static void stale_restore(NcKernel *k)
+{
+    char path[512];
+    stale_file(path, sizeof(path));
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        return;
+    }
+    uint32_t hdr[3] = {0}, p;
+    if (fread(hdr, sizeof(hdr), 1, fp) == 1 && hdr[0] == STALE_MAGIC && hdr[1] == k->vm->ram_size &&
+        (g_stale = malloc(k->vm->ram_size)) && (g_stale_page = calloc(k->vm->ram_size / NC_PAGE, 1))) {
+        for (uint32_t i = 0; i < hdr[2] && fread(&p, sizeof(p), 1, fp) == 1 && p < k->vm->ram_size / NC_PAGE &&
+                             fread(g_stale + (size_t)p * NC_PAGE, NC_PAGE, 1, fp) == 1;
+             i++) {
+            g_stale_page[p] = 1;
+            g_stale_left++;
+        }
+        nc_log("hakuX-native-mm", "the last title's RAM: %u KiB back for its blocks", g_stale_left * (NC_PAGE >> 10));
+    }
+    if (!g_stale_left) {
+        free(g_stale);
+        free(g_stale_page);
+        g_stale = g_stale_page = NULL;
+    }
+    fclose(fp);
+    unlink(path);
 }
 
 static uint32_t contig_alloc(NcKernel *k, uint32_t size, uint32_t lo, uint32_t hi, uint32_t align,
@@ -635,7 +739,7 @@ static uint32_t contig_alloc(NcKernel *k, uint32_t size, uint32_t lo, uint32_t h
         return 0;
     }
     s_failed = 0;
-    memset(k->vm->ram + pa, 0, size);
+    stale_fill(k, pa, size);
     /* An aligned block below another leaves the pages its alignment skipped
      * free between them, and virtual memory takes the highest free pages:
      * the block takes them too. On the console the blocks pack: what runs
@@ -877,14 +981,19 @@ void nc_mm_keep_save(NcKernel *k, uint32_t saved)
     char path[512];
     kept_file(path, sizeof(path));
     unlink(path);
-    if (!g_nkept) {
-        return;
-    }
     for (unsigned i = 0; i < g_nkept && k->hle_keep; i++) {
         k->hle_keep(kept_pa(k, g_kept[i].va), g_kept[i].len);
     }
+    if (k->hle_keep) {
+        k->hle_keep(0, k->vm->ram_size);    /* all of RAM goes over (stale_save) */
+    }
     if (k->hle_keep_wait && !k->hle_keep_wait(2000000000ull)) {
         nc_log("hakuX-native-mm", "kept memory: the GPU's copies did not come back; saved as it is");
+    }
+    nc_vm_will_read(NC_CONTIG_WINDOW, k->vm->ram_size);  /* the window's pages a target closed */
+    stale_save(k);
+    if (!g_nkept) {
+        return;
     }
     FILE *fp = fopen(path, "wb");
     uint32_t hdr[3] = {KEPT_MAGIC, saved, g_nkept}, bytes = 0;
@@ -911,6 +1020,7 @@ void nc_mm_keep_save(NcKernel *k, uint32_t saved)
 
 uint32_t nc_mm_keep_restore(NcKernel *k)
 {
+    stale_restore(k);
     char path[512];
     kept_file(path, sizeof(path));
     FILE *fp = fopen(path, "rb");

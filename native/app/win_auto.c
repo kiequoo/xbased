@@ -29,6 +29,7 @@ static struct {
     long long cmd_off;
     double cmd_seen;
     double until[32];       /* k_ctl's, held until then */
+    float amount[32];       /* a stick's push, 0..1 ("LUP=0.3"): 1 unless given */
     void (*save)(int), (*load)(int);
     bool menu;              /* the in-game menu asked for */
 } g_auto;
@@ -103,9 +104,17 @@ static void act(const char *a, const char *label)
         *star = 0;
         hold = atof(star + 1);
     }
+    float amount = 1;
+    char *eq = strchr(name, '=');
+    if (eq) {
+        *eq = 0;
+        amount = (float)atof(eq + 1);
+        amount = amount < 0 ? 0 : amount > 1 ? 1 : amount;
+    }
     for (unsigned i = 0; i < NCTL; i++) {
         if (!_stricmp(name, k_ctl[i].name)) {
             g_auto.until[i] = now_s() + hold;
+            g_auto.amount[i] = amount;
             nc_log("hakuX-auto", "%.1f s: %s for %.1f s", now_s() - g_auto.t0, k_ctl[i].name, hold);
             return;
         }
@@ -230,7 +239,7 @@ void nc_auto_pad(NcPadState *s)
             s->analog[k_ctl[i].analog] = 0xFF;
         } else if (k_ctl[i].stick) {
             int16_t *axis[4] = {&s->lx, &s->ly, &s->rx, &s->ry};
-            *axis[k_ctl[i].stick - 1] = (int16_t)(k_ctl[i].dir * 32767);
+            *axis[k_ctl[i].stick - 1] = (int16_t)(k_ctl[i].dir * g_auto.amount[i] * 32767);
         } else {
             s->buttons |= k_ctl[i].bit;
         }

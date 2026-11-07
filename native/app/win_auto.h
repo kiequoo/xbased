@@ -11,7 +11,8 @@
  * the run started (relaunches go on with its clock), the action. Actions:
  * a button pressed for 0.2 s (A B X Y BLACK WHITE LT RT START BACK UP DOWN
  * LEFT RIGHT LS RS, the sticks LUP LDOWN LLEFT LRIGHT RUP RDOWN RLEFT
- * RRIGHT), or held for d seconds (<button>*<d>); "shot" (a picture of the
+ * RRIGHT), or held for d seconds (<button>*<d>), a stick pushed part of the
+ * way (<stick>=<0..1>, LUP=0.3*2: a third up for 2 s); "shot" (a picture of the
  * window, HAKUX_AUTO_DIR\shot_<s>.bmp, the exe's shots folder by default);
  * "prof <secs>" (the vCPU's profile, HAKUX_PROF's, from then); "save <slot>"
  * and "load <slot>" (the front end's states, F5 and F8's); "quit".

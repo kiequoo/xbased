@@ -5,7 +5,12 @@
  * tables, except one that reads CR3 and edits entries through the 0xF0000000
  * view of RAM, as Fable's pager does: it installs page tables for windows it
  * reserved and maps its pages into them, flushing with INVLPG or a CR3
- * reload. The page directory CR3 names starts empty (no 4 MiB present).
+ * reload. The page directory CR3 names holds what the Xbox kernel's does
+ * for RAM: 4 MiB pages mapping it at 0x80000000, already applied (the core
+ * maps that view itself). Hitman 2 copies those entries to 0x08000000 and
+ * 0x88000000, cached, and works in its 46 MiB heap through the 0x88000000
+ * alias: from an empty directory it copied nothing, and the first access
+ * there was a fault the title doesn't handle (a black screen at boot).
  * After each flush, what the title wrote is applied to the guest mapping:
  * present PTEs and 4 MiB PDEs map their pages, cleared ones unmap. Entries
  * are compared with the ones applied last, so a flush costs a scan of the
@@ -39,6 +44,12 @@ uint32_t nc_paging_cr3(NcKernel *k)
         }
         memset(k->vm->ram + pa, 0, NC_PAGE);
         g_pd_pa = pa;
+        /* present, writable, accessed, dirty, 4 MiB, global */
+        for (uint32_t i = 0; i < k->vm->ram_size / LARGE_PAGE && i < 256; i++) {
+            const uint32_t pde = (i * LARGE_PAGE) | 0x1E3u;
+            nc_wr32(k->vm->ram + pa + 4 * (0x200 + i), pde);
+            g_pd_applied[0x200 + i] = pde;
+        }
         nc_log("hakuX-native", "paging: the title reads CR3; page directory at pa %08x", pa);
     }
     return g_pd_pa;

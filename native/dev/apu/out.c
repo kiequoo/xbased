@@ -51,6 +51,8 @@ static struct {
     bool started, app_paused;
     bool reopening;          /* reopen_thread runs */
     uint32_t callbacks, short_callbacks;
+    uint32_t asked_max;      /* the most bytes one callback asked for */
+    uint32_t fed_callbacks;  /* callbacks since the first frame came, to 64 (fill) */
 } g_out = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 int apu_out_queued(void)
@@ -81,6 +83,11 @@ static int pop(uint8_t *out, int bytes)
     return n;
 }
 
+int apu_out_asked_max(void)
+{
+    return (int)apu_ld(&g_out.asked_max);
+}
+
 void apu_out_stats(uint32_t *callbacks, uint32_t *short_callbacks)
 {
     *callbacks = apu_xchg(&g_out.callbacks, 0);
@@ -88,15 +95,25 @@ void apu_out_stats(uint32_t *callbacks, uint32_t *short_callbacks)
 }
 
 /* One callback's worth: what the ring has, the rest silence (a short
- * callback). It never waits: the callback runs on the device's real-time
- * thread, and the frame thread keeps one to three callbacks queued (apu.c's
- * watermarks). Paused (nc_pause_set), silence, the ring kept: the frame
+ * callback). Its size is the device's, whatever was asked at the open:
+ * PulseAudio and PipeWire can take larger periods than 512 frames, so the
+ * frame thread keeps its watermarks from the largest callback seen
+ * (apu_out_asked_max). It never waits: the callback runs on the device's
+ * real-time thread, and the frame thread keeps two to four callbacks queued
+ * (apu.c's watermarks). Paused (nc_pause_set), silence, the ring kept: the frame
  * thread stops at its high watermark. */
 static void fill(uint8_t *stream, int bytes)
 {
     if (nc_paused()) {
         memset(stream, 0, (size_t)bytes);
         return;
+    }
+    /* the device's own first fills (SDL asks for its whole buffer as it
+     * starts) left out of asked_max: its periods are what the ring is for */
+    if (g_out.fed_callbacks < 64) {
+        g_out.fed_callbacks += apu_ld_acq(&g_out.head) != 0;
+    } else if ((uint32_t)bytes > apu_ld(&g_out.asked_max)) {
+        apu_st(&g_out.asked_max, (uint32_t)bytes);
     }
     const int n = pop(stream, bytes);
     apu_inc(&g_out.callbacks);

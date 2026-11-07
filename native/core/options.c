@@ -98,6 +98,8 @@ bool nc_option(NcOptions *o, const char *arg)
     } else if ((v = value(arg, "lang="))) {
         nc_kernel_set_language(atoi(v));
         nc_log("hakuX-app", "console language %s", v);
+    } else if ((v = value(arg, "langfixed="))) {
+        nc_kernel_set_language_fixed(atoi(v) != 0);     /* the game's own: kept on any disc */
     } else if ((v = value(arg, "clock="))) {
         nc_kernel_set_clock(strtoll(v, NULL, 10));  /* none: the phone's time */
     } else if ((v = value(arg, "tz="))) {

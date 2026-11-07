@@ -51,6 +51,7 @@ typedef struct ImMap {
     int device[4];              /* -2 none, -1 keyboard only, 0 auto, k: the k-th gamepad */
     SDL_Keycode hotkey[IM_HOTKEYS];
     float deadzone;
+    float stick_antidz;         /* stick.antidz: the least a stick out of its dead zone gives, 0..1 */
     float stick_range;          /* stick.range: the output's scale, 1 = the stick's own */
     bool stick_round;           /* stick.shape=round: the stick's circle kept, not the Duke's square */
     float trigger_dz;           /* trigger.deadzone: travel ignored at the start, 0..1 */
@@ -60,7 +61,7 @@ typedef struct ImMap {
 void im_resolve(ImMap *m, const Config *global, const Config *game);
 /* A stick's position (x, y: -1..1, up positive) as the title gets it,
  * -1..1 on each axis: the dead zone, the shape and the range applied. */
-void im_stick(float x, float y, float deadzone, float range, bool round, float *ox, float *oy);
+void im_stick(float x, float y, float deadzone, float antidz, float range, bool round, float *ox, float *oy);
 /* A trigger's travel (0..1) as the title gets it, 0..1: nothing up to the
  * dead zone, full from full on, in proportion between. */
 float im_trigger(float a, float deadzone, float full);

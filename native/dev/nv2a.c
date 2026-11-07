@@ -111,6 +111,15 @@ static uint64_t g_last_vblank_ns;     /* when the last vblank came (the raster c
  * pickup skipped a frame (NGB at 60 fps: one every ~20 s). VSYNC_LEAD is the
  * phase until pickups are seen. */
 static uint64_t g_disp_vsync_ns, g_disp_period_ns;
+/* The display mode's refresh period (nc_dev_nv2a_display_nominal; 0: not
+ * known). The vsyncs seen apart from it aren't the panel's: a variable
+ * refresh rate display (G-Sync, FreeSync) refreshes as frames come, and the
+ * compositor's vblanks then follow the presents, or come every other tick
+ * (Windows' DwmFlush, every 5.87 ms beside a 280 Hz mode). Locked to them,
+ * the vblank followed its own presents, and the game ran at 57 or 62 fps:
+ * it runs free instead. */
+static uint64_t g_disp_nominal_ns;
+static bool g_vblank_locked;          /* next_vblank's last: locked to the vsyncs */
 static int64_t g_pick_off_ns = -1;    /* pickups after a vsync (smoothed, 0..period) */
 #define VSYNC_LEAD   3000000ll
 #define VSYNC_STALE  200000000ull
@@ -633,6 +642,16 @@ void nc_dev_nv2a_display_vsync(uint64_t ns)
     __atomic_store_n(&g_disp_vsync_ns, ns, __ATOMIC_RELEASE);
 }
 
+bool nc_dev_nv2a_vblank_locked(void)
+{
+    return __atomic_load_n(&g_vblank_locked, __ATOMIC_RELAXED);
+}
+
+void nc_dev_nv2a_display_nominal(uint64_t period_ns)
+{
+    __atomic_store_n(&g_disp_nominal_ns, period_ns, __ATOMIC_RELAXED);
+}
+
 uint64_t nc_dev_nv2a_next_vsync(uint64_t after)
 {
     const uint64_t vs = __atomic_load_n(&g_disp_vsync_ns, __ATOMIC_ACQUIRE);
@@ -685,6 +704,7 @@ static uint64_t next_vblank(uint64_t prev)
     const uint64_t frame = __atomic_load_n(&g_frame_ns, __ATOMIC_RELAXED);
     const uint64_t vs = __atomic_load_n(&g_disp_vsync_ns, __ATOMIC_ACQUIRE);
     const uint64_t pd = __atomic_load_n(&g_disp_period_ns, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_vblank_locked, false, __ATOMIC_RELAXED);
     if (!vs || !pd || now_ns() - vs > VSYNC_STALE) {
         return prev + frame;                /* no panel (the app in the background) */
     }
@@ -692,6 +712,11 @@ static uint64_t next_vblank(uint64_t prev)
     if (k < 1 || k > 4 || llabs((int64_t)(k * pd) - (int64_t)frame) > (int64_t)(frame / 20)) {
         return prev + frame;                /* 90 Hz and the like: free running */
     }
+    const uint64_t nominal = __atomic_load_n(&g_disp_nominal_ns, __ATOMIC_RELAXED);
+    if (nominal && llabs((int64_t)pd - (int64_t)nominal) > (int64_t)(nominal / 50)) {
+        return prev + frame;                /* not the panel's vsyncs (variable refresh): free running */
+    }
+    __atomic_store_n(&g_vblank_locked, true, __ATOMIC_RELAXED);
     const uint64_t next = prev + k * pd;
     const int64_t pick = __atomic_load_n(&g_pick_off_ns, __ATOMIC_RELAXED);
     const int64_t at = pick < 0 ? -VSYNC_LEAD : pick + (int64_t)pd / 2;  /* after a vsync */

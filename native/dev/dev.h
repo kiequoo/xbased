@@ -26,6 +26,12 @@ void nc_dev_nv2a_vblank_multiply(unsigned n);
 /* A vsync of the panel the frames are shown on (host monotonic ns, the
  * Choreographer's frame time): the vblank locks to the panel's. */
 void nc_dev_nv2a_display_vsync(uint64_t ns);
+/* The display's own refresh period (its mode's, ns; 0: unknown): the vblank
+ * locks to the vsyncs seen only while they keep to it. */
+void nc_dev_nv2a_display_nominal(uint64_t period_ns);
+/* True while the vblank is locked to the display's vsyncs (a fixed refresh
+ * rate that a frame is a whole number of). */
+bool nc_dev_nv2a_vblank_locked(void);
 /* The presenter looked for a new front image (host monotonic ns): the vblank
  * keeps half a panel period from its pickups. */
 void nc_dev_nv2a_display_pickup(uint64_t ns);

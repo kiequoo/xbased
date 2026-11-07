@@ -14,6 +14,9 @@
 
 typedef struct In {
     bool up, down, left, right, ok, back, x, y, lb, rb, start;
+    bool lt, rt;            /* the triggers pulled (Z, C) */
+    bool view;              /* the gamepad's View button (V) */
+    bool find;              /* F3, Ctrl+F */
     float mx, my, wheel;    /* the mouse, in 720p units */
     bool click, moved, rclick;
     bool any;               /* something was pressed (screensaver, hints) */
@@ -28,7 +31,7 @@ typedef struct In {
 enum Screen {
     SCR_MAIN, SCR_GAMES, SCR_GAME, SCR_GAME_SETTINGS, SCR_MODS, SCR_STATES, SCR_SETTINGS, SCR_CONTROLS,
     SCR_REMAP, SCR_MEMORY, SCR_MEMORY_TITLE, SCR_ONLINE, SCR_ABOUT, SCR_INGAME, SCR_INGAME_SLOTS, SCR_STICKS,
-    SCR_TRIGGERS, SCR_COUNT
+    SCR_TRIGGERS, SCR_BROWSE, SCR_FIND, SCR_COUNT
 };
 
 typedef struct Dash {
@@ -61,6 +64,7 @@ typedef struct Dash {
     size_t edit_cap;
     const char *edit_key;
     char edit_tmp[256];
+    bool typing;                /* a text field takes the letters: they don't move or press */
 } Dash;
 
 extern Dash D;
@@ -92,7 +96,7 @@ void list_begin(List *l, float x, float y, float w, float h, float row_h);
 /* A row: its label and value; true when chosen (A, Enter, a click). delta:
  * left/right on it (-1, +1), may be NULL. */
 bool list_row(List *l, const char *label, const char *value, int *delta);
-bool list_row_icon(List *l, SDL_Texture *icon, const char *label, const char *sub, const char *value, int *delta);
+bool list_row_icon(List *l, UiTex *icon, const char *label, const char *sub, const char *value, int *delta);
 void list_end(List *l);
 bool list_selected(const List *l);   /* the last row is the selected one */
 
@@ -105,8 +109,12 @@ void opt_videoflag(List *l, enum UiStr label, unsigned bit);
 
 /* drawing helpers */
 void draw_header(const char *title, const char *sub);
-void draw_hints(const char *a, const char *b, const char *x, const char *y);
-void draw_button_glyph(float x, float y, int which, float size);   /* 0 A, 1 B, 2 X, 3 Y */
+/* the hints' row: A, B, X, Y (NULL: left out); its end's x */
+float draw_hints(const char *a, const char *b, const char *x, const char *y);
+/* one more hint at px (which: as draw_button_glyph's); its end's x */
+float draw_hint_at(float px, int which, const char *text);
+/* 0 A, 1 B, 2 X, 3 Y, 4 the triggers (LT RT), 5 View */
+void draw_button_glyph(float x, float y, int which, float size);
 float ease(float t);
 
 /* the screens */
@@ -121,14 +129,33 @@ void scr_online(void);
 void scr_game_settings(void);
 void scr_mods(void);
 void scr_states(void);
-/* the folder picker's answer: a game folder added (SDL_ShowOpenFolderDialog) */
-void add_folder_cb(void *ud, const char *const *files, int filter);
-void dash_take_folder(void);
-/* a game file started without adding it to the library: a dialog for one,
- * or one given (dropped on the window) */
-void dash_pick_play_file(void);
+/* The Games screen's search, filters, order and view (dash_find.c):
+ * dash_find_list fills out with the games they let through, in order;
+ * dash_find_group is a game's group in that order (the triggers jump
+ * between groups), dash_find_group_name its name; dash_find_desc the
+ * search and filters in a few words ("" for none). */
+int dash_find_list(LibGame **out, int max);
+int dash_find_group(const LibGame *g);
+const char *dash_find_group_name(const LibGame *g);
+const char *dash_find_desc(void);
+int dash_find_view(void);   /* 0 large covers, 1 small covers, 2 icons and names */
+void dash_find_next_view(void);
+/* The search screen pushed; typing: the keyboard up at once */
+void dash_find_open(bool typing);
+void dash_find_clear(void);    /* no search, no filters */
+void scr_find(void);
+/* The file browser (dash_browse.c), the dashboard's own for the gamepad,
+ * the keyboard and the mouse: dash_browse_games adds folders and game
+ * files to the library; dash_browse_file has one file chosen (exts:
+ * "png;jpg", NULL any) and hands it to cb as a file dialog would. */
+void dash_browse_games(void);
+void dash_browse_file(const char *title, const char *exts, SDL_DialogFileCallback cb, void *ud);
+void scr_browse(void);
+/* a game file started without adding it to the library: one chosen, or
+ * dropped on the window; dash_take_folder starts it from the UI's thread */
 void dash_play_file_later(const char *path);
-void dash_pick_game_file(void);  /* a disc image the folders don't have, added on its own */    /* each frame: a folder picked meanwhile goes in */
+void dash_pick_play_file(void);
+void dash_take_folder(void);
 
 /* the game's files */
 void game_cfg_path(const LibGame *g, char *out, size_t n);

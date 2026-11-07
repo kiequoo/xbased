@@ -124,7 +124,15 @@ static const NvSetting k_nv[] = {
     {XC_ENCRYPTED_SECTION, 0x00, 0x30}, {XC_MAX_ALL, 0x00, EEPROM_SIZE},
 };
 
+/* The image the titles see (g_eeprom: the stored one with this run's
+ * settings, the app's, over it) and the stored one (g_eeprom_disk, what
+ * <hdd>/eeprom.bin holds). A title's ExSaveNonVolatileSetting goes to both;
+ * this run's settings (a game's own language, the regions of the running
+ * title, the English a disc without the language gets) never reach the
+ * file, which keeps the console's settings as the app and the titles set
+ * them (the app reads them back: app/ui/console_cfg.c). */
 static uint8_t g_eeprom[EEPROM_SIZE];
+static uint8_t g_eeprom_disk[EEPROM_SIZE];
 static bool g_eeprom_ready;
 
 /* The app's video settings (nc_kernel_set_video). */
@@ -137,12 +145,19 @@ void nc_kernel_set_video(int64_t flags, int av_pack)
     g_av_pack = av_pack;
 }
 
-/* The app's language (nc_kernel_set_language); 0 keeps the stored one. */
+/* The app's language (nc_kernel_set_language); 0 keeps the stored one.
+ * Fixed: the game's own setting, kept even on a disc that seems to lack it. */
 static int g_language;
+static bool g_language_fixed;
 
 void nc_kernel_set_language(int language)
 {
     g_language = language >= 1 && language <= 9 ? language : 0;
+}
+
+void nc_kernel_set_language_fixed(bool fixed)
+{
+    g_language_fixed = fixed;
 }
 
 /* The app's audio (nc_kernel_set_audio): stereo unless 5.1 was chosen. */
@@ -249,6 +264,13 @@ static bool sec_decrypt(void)
         }
     }
     return false;
+}
+
+/* The stored image's two checksums (its encrypted section as it was). */
+static void disk_checksums(void)
+{
+    nc_wr32(g_eeprom_disk + 0x30, eeprom_checksum(g_eeprom_disk + 0x34, 0x2C));
+    nc_wr32(g_eeprom_disk + 0x60, eeprom_checksum(g_eeprom_disk + 0x64, 0x5C));
 }
 
 static void eeprom_seal(void)
@@ -358,11 +380,14 @@ static void eeprom_renew(void)
 /* The image, whole or not at all: a new file put in the old one's place. */
 static void eeprom_store(void)
 {
+    if (!g_eeprom_ready) {
+        memcpy(g_eeprom_disk, g_eeprom, sizeof(g_eeprom_disk)); /* loading: no run's settings on it yet */
+    }
     char p[320], tmp[330];
     eeprom_path(p, sizeof(p));
     snprintf(tmp, sizeof(tmp), "%s.new", p);
     FILE *out = fopen(tmp, "wb");
-    bool ok = out && fwrite(g_eeprom, 1, sizeof(g_eeprom), out) == sizeof(g_eeprom);
+    bool ok = out && fwrite(g_eeprom_disk, 1, sizeof(g_eeprom_disk), out) == sizeof(g_eeprom_disk);
     if (out) {
         ok = fflush(out) == 0 && fsync(fileno(out)) == 0 && ok;
         ok = fclose(out) == 0 && ok;
@@ -370,6 +395,21 @@ static void eeprom_store(void)
     if (!ok || rename(tmp, p) != 0) {
         nc_log("hakuX-native", "ex: can't keep the EEPROM in %s", p);
         unlink(tmp);
+    }
+}
+
+/* A new image's settings as the app's record of what it wrote last
+ * (<hdd>/eeprom.sync, app/ui/console_cfg.c): the app's next start sees the
+ * file unchanged since and writes its settings over it, where an image
+ * without the record could be one changed by hand. */
+static void eeprom_sync_record(void)
+{
+    char p[330];
+    snprintf(p, sizeof(p), "%s/eeprom.sync", nc_io_hdd_root());
+    FILE *f = fopen(p, "w");
+    if (f) {
+        fprintf(f, "lang=%u video=%x\n", nc_rd32(g_eeprom_disk + 0x90), nc_rd32(g_eeprom_disk + 0x94) & 0x001F0000u);
+        fclose(f);
     }
 }
 
@@ -388,7 +428,17 @@ static uint8_t *eeprom(NcKernel *k)
             nc_log("hakuX-native", "ex: %s isn't a whole EEPROM: a new one for this run", p);
         } else if (!have) {
             eeprom_create(k);
+            /* set as the app's settings have the console (a game's own
+             * language not: it's the game's, the console's stays English) */
+            if (g_language && !g_language_fixed) {
+                nc_wr32(g_eeprom + 0x90, (uint32_t)g_language);
+            }
+            if (g_video_flags >= 0) {
+                nc_wr32(g_eeprom + 0x94, (uint32_t)g_video_flags & 0x001F0000u);
+            }
+            eeprom_seal();
             eeprom_store();
+            eeprom_sync_record();
             nc_log("hakuX-native", "ex: new console EEPROM in %s", p);
         } else {
             g_sec_plain = !sec_decrypt();
@@ -398,6 +448,7 @@ static uint8_t *eeprom(NcKernel *k)
             eeprom_upgrade();
             eeprom_renew();
         }
+        memcpy(g_eeprom_disk, g_eeprom, sizeof(g_eeprom_disk));
         /* The regions follow the running title (a library mixes NTSC and
          * PAL discs); the rest stays as stored. A title always sees the
          * same image. */
@@ -432,10 +483,17 @@ static uint8_t *eeprom(NcKernel *k)
          * English under the language's name (io.c's fallback) weren't
          * enough: Fable checked its Spanish folder, found none, and went
          * on with half of a language loaded until it crashed. */
+        /* A language set for the game itself is kept: the folders are a
+         * guess, and a disc may keep its languages some other way. */
         const uint32_t lang = nc_rd32(g_eeprom + 0x90);
         if (lang >= 2 && nc_io_disc_lacks_language(k->disc, (int)lang)) {
-            nc_wr32(g_eeprom + 0x90, 1);
-            nc_log("hakuX-native", "ex: the disc hasn't the console's language (%u): English", lang);
+            if (g_language_fixed) {
+                nc_log("hakuX-native", "ex: the disc seems to lack the console's language (%u), kept: the game's own setting", lang);
+            } else {
+                nc_wr32(g_eeprom + 0x90, 1);
+                nc_log("hakuX-native", "ex: the disc hasn't the console's language (%u): English (set the language in the "
+                                       "game's settings to keep it)", lang);
+            }
         }
         /* And the time zone, the phone's: its offset from UTC now as the
          * bias (UTC = local time + bias, minutes), without daylight saving
@@ -506,10 +564,15 @@ static uint64_t ExSaveNonVolatileSetting(NcKernel *k, NcFrame *f, const uint32_t
     }
     uint8_t *e = eeprom(k);
     const uint32_t n = a[3] < s->size ? a[3] : s->size;
+    const uint8_t *src = nc_vm_host(k->vm, a[2]);
     memset(e + s->offset, 0, s->size);
-    memcpy(e + s->offset, nc_vm_host(k->vm, a[2]), n);
+    memcpy(e + s->offset, src, n);
+    memset(g_eeprom_disk + s->offset, 0, s->size);
+    memcpy(g_eeprom_disk + s->offset, src, n);
     eeprom_seal();
+    disk_checksums();
     eeprom_store();
+    nc_log("hakuX-native", "ex: the title saved setting %x (%u bytes) in the EEPROM", s->index, n);
     return NC_STATUS_SUCCESS;
 }
 

@@ -1,9 +1,9 @@
 /*
  * hakuX front end — the game library (library.h).
  *
- * The cache (<data>/covers/library.txt): a line a disc image, its path,
- * size, modification time and certificate fields, so a rescan reads only
- * new or changed images; their title icons (<key>.icon.png) beside. Box
+ * The cache (<data>/covers/library.txt, cache_load): a line a file, so the
+ * library shows at once and a scan reads only new or changed images; their
+ * title icons (<key>.icon.png) beside. Box
  * art (<key>.png) comes from libretro-thumbnails' list of names, matched
  * to the game's title by its words, preferring the disc's region.
  */
@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_STATIC
@@ -25,19 +26,26 @@
 #define STB_IMAGE_WRITE_STATIC
 #include "stb_image_write.h"
 
-#define MAX_GAMES 4096
+#define MAX_GAMES 16384     /* files: the games and their second copies */
+#define HASH_SIZE 32768     /* by_path's slots (a power of two, over MAX_GAMES) */
 #define THUMBS "https://raw.githubusercontent.com/libretro-thumbnails/Microsoft_-_Xbox/master/Named_Boxarts/"
 #define TREE "https://api.github.com/repos/libretro-thumbnails/Microsoft_-_Xbox/git/trees/master?recursive=1"
 
+struct ScanArgs;
+
 static struct {
     SDL_Mutex *mu;
-    LibGame *games[MAX_GAMES];
+    LibGame *games[MAX_GAMES];      /* every entry, by title */
     int n;
+    LibGame *by_path[HASH_SIZE];    /* the same, by file */
     SDL_Thread *scan, *fetch;
-    SDL_AtomicInt scanning, fetching, stop;
+    SDL_AtomicInt scanning, fetching, stop, restart, busy;
+    struct ScanArgs *pending;       /* a scan asked for while one ran */
+    unsigned pass;                  /* the scan's, counted */
+    bool loaded;                    /* the cache's games in */
     char status[160];
-    /* fetch queue: indices */
-    int queue[MAX_GAMES], nq;
+    LibGame *queue[MAX_GAMES];      /* box art to fetch */
+    int nq;
 } L;
 
 /* strsep's: the text up to the next delimiter, *s past it (NULL at the end) */
@@ -66,73 +74,6 @@ static bool is_image_name(const char *name)
                    !SDL_strcasecmp(dot, ".chd"));
 }
 
-/* ------------------------------------------------------------ the cache */
-
-typedef struct {
-    char path[1024];
-    int64_t size, mtime;
-    XdGame g;
-} CacheRow;
-
-static CacheRow *g_cache;
-static int g_ncache;
-
-static void cache_load(void)
-{
-    char p[1100];
-    covers_dir(p, sizeof(p));
-    strcat(p, "/library.txt");
-    FILE *f = fopen(p, "rb");
-    if (!f) {
-        return;
-    }
-    g_cache = calloc(MAX_GAMES, sizeof(CacheRow));
-    char line[1600];
-    while (g_ncache < MAX_GAMES && fgets(line, sizeof(line), f)) {
-        CacheRow *r = &g_cache[g_ncache];
-        char *fld[7];
-        int k = 0;
-        for (char *s = line, *t; k < 7 && (t = tok(&s, "\t")); k++) {
-            fld[k] = t;
-        }
-        if (k < 7) {
-            continue;
-        }
-        fld[6][strcspn(fld[6], "\r\n")] = 0;
-        snprintf(r->path, sizeof(r->path), "%s", fld[0]);
-        r->size = strtoll(fld[1], NULL, 10);
-        r->mtime = strtoll(fld[2], NULL, 10);
-        r->g.title_id = (uint32_t)strtoul(fld[3], NULL, 16);
-        r->g.version = (uint32_t)strtoul(fld[4], NULL, 10);
-        r->g.regions = (uint32_t)strtoul(fld[5], NULL, 10);
-        snprintf(r->g.title, sizeof(r->g.title), "%s", fld[6]);
-        snprintf(r->g.path, sizeof(r->g.path), "%s", r->path);
-        snprintf(r->g.key, sizeof(r->g.key), "%08X.%u", r->g.title_id, r->g.version);
-        r->g.size = r->size;
-        g_ncache++;
-    }
-    fclose(f);
-}
-
-static void cache_save(void)
-{
-    char p[1100];
-    covers_dir(p, sizeof(p));
-    strcat(p, "/library.txt");
-    FILE *f = fopen(p, "wb");
-    if (!f) {
-        return;
-    }
-    SDL_LockMutex(L.mu);
-    for (int i = 0; i < L.n; i++) {
-        const LibGame *g = L.games[i];
-        fprintf(f, "%s\t%lld\t%lld\t%08X\t%u\t%u\t%s\n", g->g.path, (long long)g->g.size, (long long)g->mtime,
-                g->g.title_id, g->g.version, g->g.regions, g->orig[0] ? g->orig : g->g.title);
-    }
-    SDL_UnlockMutex(L.mu);
-    fclose(f);
-}
-
 static void icon_path(const XdGame *g, char *out, size_t n)
 {
     char d[1100];
@@ -150,16 +91,18 @@ static void cover_path(const XdGame *g, char *out, size_t n)
 /* ------------------------------------------------------------ the user's */
 
 /* custom.txt: a line a game the user changed, its key, 1 if hidden (else
- * 0), and its name ("" for the disc's) */
+ * 0), its name ("" for the disc's), then 1 if a favorite and when it was
+ * last played (a time_t; both left out by older versions) */
 typedef struct {
     char key[24];
-    bool hidden;
+    bool hidden, fav;
     char name[128];
+    int64_t played;
 } Custom;
 
 static Custom *g_custom;
 static int g_ncustom;
-static bool g_custom_loaded, g_show_hidden = true;   /* the Games screen sets it while it draws */
+static bool g_custom_loaded, g_custom_broken, g_show_hidden = true;   /* the Games screen sets it while it draws */
 
 static void custom_path(char *out, size_t n)
 {
@@ -183,19 +126,24 @@ static void custom_load(void)
         if (f) {
             fclose(f);
         }
+        /* there but not readable (in use, say): left alone, not written over */
+        g_custom_broken = !g_custom || SDL_GetPathInfo(p, NULL);
         return;
     }
     char line[400];
     while (g_ncustom < MAX_GAMES && fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = 0;
-        char *s = line, *key = tok(&s, "\t"), *hid = tok(&s, "\t"), *name = s ? s : "";
+        char *s = line, *key = tok(&s, "\t"), *hid = tok(&s, "\t"), *name = tok(&s, "\t");
+        char *fav = tok(&s, "\t"), *played = tok(&s, "\t");
         if (!key || !*key || !hid) {
             continue;
         }
         Custom *c = &g_custom[g_ncustom++];
         snprintf(c->key, sizeof(c->key), "%s", key);
         c->hidden = *hid == '1';
-        snprintf(c->name, sizeof(c->name), "%s", name);
+        snprintf(c->name, sizeof(c->name), "%s", name ? name : "");
+        c->fav = fav && *fav == '1';
+        c->played = played ? strtoll(played, NULL, 10) : 0;
     }
     fclose(f);
 }
@@ -203,19 +151,30 @@ static void custom_load(void)
 /* L.mu held */
 static void custom_save(void)
 {
-    char p[1200];
+    if (g_custom_broken) {
+        return;
+    }
+    char p[1200], tmp[1210];
     custom_path(p, sizeof(p));
-    FILE *f = fopen(p, "wb");
+    snprintf(tmp, sizeof(tmp), "%s.new", p);
+    FILE *f = fopen(tmp, "wb");
     if (!f) {
         return;
     }
     for (int i = 0; i < g_ncustom; i++) {
         const Custom *c = &g_custom[i];
-        if (c->hidden || c->name[0]) {
-            fprintf(f, "%s\t%d\t%s\n", c->key, c->hidden ? 1 : 0, c->name);
+        if (c->hidden || c->name[0] || c->fav || c->played) {
+            fprintf(f, "%s\t%d\t%s\t%d\t%lld\n", c->key, c->hidden ? 1 : 0, c->name, c->fav ? 1 : 0,
+                    (long long)c->played);
         }
     }
-    fclose(f);
+    /* whole, then in the old one's place: a crash halfway keeps the old */
+    if (fclose(f) == 0) {
+        remove(p);
+        rename(tmp, p);
+    } else {
+        remove(tmp);
+    }
 }
 
 /* L.mu held: the user's for key (made if want) */
@@ -241,6 +200,8 @@ static void custom_apply(LibGame *g)
 {
     const Custom *c = custom_of(g->g.key, false);
     g->hidden = c && c->hidden;
+    g->fav = c && c->fav;
+    g->played = c ? c->played : 0;
     if (c && c->name[0]) {
         if (!g->orig[0]) {
             snprintf(g->orig, sizeof(g->orig), "%s", g->g.title);
@@ -249,77 +210,390 @@ static void custom_apply(LibGame *g)
     }
 }
 
+/* ------------------------------------------------------------ the entries */
+
+int lib_title_group(const char *t)
+{
+    for (; *t; t++) {
+        const unsigned char c = (unsigned char)*t;
+        if (c < 0x80 && isalpha(c)) {
+            return toupper(c) - 'A' + 1;
+        }
+        if (c >= 0x80 || isdigit(c)) {
+            return 0;
+        }
+        /* spaces, quotes and the like before the name: past them */
+    }
+    return 0;
+}
+
+/* numbers and the rest first, then A to Z; the same name: by file */
+static int cmp_title(const void *a, const void *b)
+{
+    const LibGame *x = *(LibGame *const *)a, *y = *(LibGame *const *)b;
+    const int gx = lib_title_group(x->g.title), gy = lib_title_group(y->g.title);
+    if (gx != gy) {
+        return gx - gy;
+    }
+    const int c = SDL_strcasecmp(x->g.title, y->g.title);
+    return c ? c : strcmp(x->g.path, y->g.path);
+}
+
+static unsigned path_hash(const char *s)
+{
+    unsigned h = 2166136261u;
+    for (; *s; s++) {
+        h = (h ^ (unsigned char)*s) * 16777619u;
+    }
+    return h;
+}
+
+/* L.mu held: the entry of a file */
+static LibGame *by_path(const char *path)
+{
+    for (unsigned h = path_hash(path) & (HASH_SIZE - 1);; h = (h + 1) & (HASH_SIZE - 1)) {
+        LibGame *g = L.by_path[h];
+        if (!g || !strcmp(g->g.path, path)) {
+            return g;
+        }
+    }
+}
+
+/* L.mu held: g in its place by title */
+static void insert_sorted(LibGame *g)
+{
+    int lo = 0, hi = L.n;
+    while (lo < hi) {
+        const int m = (lo + hi) / 2;
+        if (cmp_title(&L.games[m], &g) < 0) {
+            lo = m + 1;
+        } else {
+            hi = m;
+        }
+    }
+    memmove(&L.games[lo + 1], &L.games[lo], (size_t)(L.n - lo) * sizeof(L.games[0]));
+    L.games[lo] = g;
+    L.n++;
+}
+
+/* L.mu held: a new entry (L.n < MAX_GAMES) */
+static void insert(LibGame *g)
+{
+    insert_sorted(g);
+    unsigned h = path_hash(g->g.path) & (HASH_SIZE - 1);
+    while (L.by_path[h]) {
+        h = (h + 1) & (HASH_SIZE - 1);
+    }
+    L.by_path[h] = g;
+}
+
+static bool better(const LibGame *a, const LibGame *b)
+{
+    return a->g.size != b->g.size ? a->g.size < b->g.size : strcmp(a->g.path, b->g.path) < 0;
+}
+
+/* L.mu held: one entry a game, version and regions shown, the smallest
+ * file of those there (an XISO before a full dump of the same disc) */
+static void dedupe(LibGame *g)
+{
+    g->dup = false;
+    if (!g->g.title_id) {
+        return;
+    }
+    LibGame *best = NULL;
+    for (int i = 0; i < L.n; i++) {
+        LibGame *e = L.games[i];
+        if (e->g.title_id == g->g.title_id && e->g.version == g->g.version && e->g.regions == g->g.regions) {
+            e->dup = true;
+            if (!e->gone && (!best || better(e, best))) {
+                best = e;
+            }
+        }
+    }
+    if (best) {
+        best->dup = false;
+    }
+}
+
+static int cmp_key(const void *a, const void *b)
+{
+    const LibGame *x = *(LibGame *const *)a, *y = *(LibGame *const *)b;
+    if (x->g.title_id != y->g.title_id) {
+        return x->g.title_id < y->g.title_id ? -1 : 1;
+    }
+    if (x->g.version != y->g.version) {
+        return x->g.version < y->g.version ? -1 : 1;
+    }
+    if (x->g.regions != y->g.regions) {
+        return x->g.regions < y->g.regions ? -1 : 1;
+    }
+    if (x->gone != y->gone) {
+        return x->gone ? 1 : -1;
+    }
+    return better(x, y) ? -1 : better(y, x) ? 1 : 0;
+}
+
+/* L.mu held: dedupe for every game at once */
+static void dedupe_all(void)
+{
+    LibGame **v = malloc((size_t)(L.n ? L.n : 1) * sizeof(*v));
+    if (!v) {
+        return;
+    }
+    memcpy(v, L.games, (size_t)L.n * sizeof(*v));
+    qsort(v, L.n, sizeof(*v), cmp_key);
+    for (int i = 0; i < L.n; i++) {
+        const bool first = !i || v[i]->g.title_id != v[i - 1]->g.title_id || v[i]->g.version != v[i - 1]->g.version ||
+                           v[i]->g.regions != v[i - 1]->g.regions;
+        v[i]->dup = v[i]->g.title_id && (!first || v[i]->gone);
+    }
+    free(v);
+}
+
 static bool shown(const LibGame *g)
 {
-    return g->g.path[0] && (!g->hidden || g_show_hidden);
+    return !g->gone && !g->dup && (!g->hidden || g_show_hidden);
+}
+
+/* ------------------------------------------------------------ the cache */
+
+/* <data>/covers/library.txt: a line a file (games and second copies) as
+ * the last scan left them, its path, size, modification time, title ID,
+ * version, regions, year and title, so the library shows at once and a
+ * scan reads only new or changed files. A file on a disk that's away
+ * (its folder not there) stays in it for when the disk is back. */
+typedef struct ScanArgs {
+    char dirs[48][1024];    /* folders, and game files added one by one */
+    int n;
+} ScanArgs;
+
+static void cache_file(char *out, size_t n)
+{
+    char d[1100];
+    covers_dir(d, sizeof(d));
+    snprintf(out, n, "%s/library.txt", d);
+}
+
+/* path in one of the folders, or one of the files */
+static int under(const ScanArgs *a, const char *path)
+{
+    for (int i = 0; i < a->n; i++) {
+        const char *d = a->dirs[i];
+        const size_t n = strlen(d);
+#ifdef _WIN32
+        const bool pre = n && !SDL_strncasecmp(path, d, n);
+#else
+        const bool pre = n && !strncmp(path, d, n);
+#endif
+        if (pre && (!path[n] || path[n] == '/' || path[n] == '\\' || d[n - 1] == '/' || d[n - 1] == '\\')) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* L.mu held: the last run's games, those in a's folders (there: which of
+ * them are, looked at before) */
+static void cache_load(const ScanArgs *a, const bool *there)
+{
+    char p[1200];
+    cache_file(p, sizeof(p));
+    FILE *f = fopen(p, "rb");
+    if (!f) {
+        return;
+    }
+    char line[1600];
+    while (L.n < MAX_GAMES && fgets(line, sizeof(line), f)) {
+        char *fld[8];
+        int k = 0;
+        for (char *s = line, *t; k < 8 && (t = tok(&s, "\t")); k++) {
+            fld[k] = t;
+        }
+        if (k < 7) {
+            continue;
+        }
+        const int in = under(a, fld[0]);
+        if (in < 0 || by_path(fld[0])) {
+            continue;
+        }
+        LibGame *e = calloc(1, sizeof(*e));
+        if (!e) {
+            break;
+        }
+        XdGame *g = &e->g;
+        snprintf(g->path, sizeof(g->path), "%s", fld[0]);
+        g->size = strtoll(fld[1], NULL, 10);
+        e->mtime = strtoll(fld[2], NULL, 10);
+        g->title_id = (uint32_t)strtoul(fld[3], NULL, 16);
+        g->version = (uint32_t)strtoul(fld[4], NULL, 10);
+        g->regions = (uint32_t)strtoul(fld[5], NULL, 10);
+        const char *title = fld[k - 1];
+        if (k == 8) {
+            g->year = atoi(fld[6]);
+        } else {
+            e->mtime = -1;      /* written before the year was: read again */
+        }
+        snprintf(g->title, sizeof(g->title), "%.*s", (int)strcspn(title, "\r\n"), title);
+        snprintf(g->key, sizeof(g->key), "%08X.%u", g->title_id, g->version);
+        e->gone = !there[in];   /* its disk is away */
+        custom_apply(e);
+        insert(e);
+    }
+    fclose(f);
+    dedupe_all();
+}
+
+static void cache_save(const ScanArgs *a)
+{
+    bool there[48];
+    for (int i = 0; i < a->n; i++) {
+        there[i] = SDL_GetPathInfo(a->dirs[i], NULL);
+    }
+    char p[1200], tmp[1210];
+    cache_file(p, sizeof(p));
+    snprintf(tmp, sizeof(tmp), "%s.new", p);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        return;
+    }
+    SDL_LockMutex(L.mu);
+    for (int i = 0; i < L.n; i++) {
+        const LibGame *g = L.games[i];
+        if (g->gone || g->replaced) {
+            /* gone from a library folder that's there: gone for good (a game's own
+             * folder deleted too); else the disk it's on is away, for when it's back */
+            const int in = under(a, g->g.path);
+            if (g->replaced || in < 0 || there[in]) {
+                continue;
+            }
+        }
+        fprintf(f, "%s\t%lld\t%lld\t%08X\t%u\t%u\t%d\t%s\n", g->g.path, (long long)g->g.size, (long long)g->mtime,
+                g->g.title_id, g->g.version, g->g.regions, g->g.year, g->orig[0] ? g->orig : g->g.title);
+    }
+    SDL_UnlockMutex(L.mu);
+    const bool ok = fclose(f) == 0;
+    if (ok) {
+        remove(p);
+        rename(tmp, p);
+    } else {
+        remove(tmp);
+    }
 }
 
 /* ------------------------------------------------------------ scanning */
 
-static int cmp_title(const void *a, const void *b)
+static bool scan_stopped(void)
 {
-    return SDL_strcasecmp((*(LibGame *const *)a)->g.title, (*(LibGame *const *)b)->g.title);
+    return SDL_GetAtomicInt(&L.stop) || SDL_GetAtomicInt(&L.restart);
 }
 
 static void add_game(const char *path, const SDL_PathInfo *pi)
 {
-    for (int i = 0; i < L.n; i++) {
-        if (!strcmp(L.games[i]->g.path, path)) {
-            return;
-        }
-    }
-    LibGame *lg = calloc(1, sizeof(*lg));
-    lg->mtime = pi->modify_time;
-    bool cached = false;
-    for (int i = 0; i < g_ncache; i++) {
-        if (!strcmp(g_cache[i].path, path) && g_cache[i].size == (int64_t)pi->size && g_cache[i].mtime == pi->modify_time) {
-            lg->g = g_cache[i].g;
-            cached = true;
-            break;
-        }
-    }
-    if (!cached) {
-        xd_read_game(path, &lg->g);
-        if (lg->g.icon) {
-            char ip[1200];
-            icon_path(&lg->g, ip, sizeof(ip));
-            stbi_write_png(ip, lg->g.icon_w, lg->g.icon_h, 4, lg->g.icon, lg->g.icon_w * 4);
-            xd_free_game(&lg->g);
-        }
-        lg->g.size = (int64_t)pi->size;
-    }
     SDL_LockMutex(L.mu);
-    custom_apply(lg);
-    /* one entry per game and version: an XISO before a full dump of it */
-    for (int i = 0; i < L.n; i++) {
-        LibGame *o = L.games[i];
-        if (o->g.title_id && o->g.title_id == lg->g.title_id && o->g.version == lg->g.version) {
-            if (o->g.size > lg->g.size) {
-                L.games[i] = lg;
-                lg = o;
-            }
+    LibGame *e = by_path(path);
+    if (e && e->g.size == (int64_t)pi->size && e->mtime == (int64_t)pi->modify_time) {
+        e->seen = L.pass;       /* as it was */
+        if (e->gone) {
+            e->gone = false;
+            dedupe(e);
+        }
+        SDL_UnlockMutex(L.mu);
+        return;
+    }
+    const bool full = !e && L.n >= MAX_GAMES;
+    SDL_UnlockMutex(L.mu);
+    if (full) {
+        return;
+    }
+    /* new, or changed since: read */
+    XdGame g;
+    xd_read_game(path, &g);
+    if (g.icon) {
+        char ip[1200];
+        icon_path(&g, ip, sizeof(ip));
+        stbi_write_png(ip, g.icon_w, g.icon_h, 4, g.icon, g.icon_w * 4);
+        xd_free_game(&g);
+    }
+    g.size = (int64_t)pi->size;
+    SDL_LockMutex(L.mu);
+    if (!e) {
+        e = calloc(1, sizeof(*e));
+        if (!e) {
             SDL_UnlockMutex(L.mu);
-            free(lg);
             return;
         }
-    }
-    if (L.n < MAX_GAMES) {
-        L.games[L.n++] = lg;
-        qsort(L.games, L.n, sizeof(L.games[0]), cmp_title);
+        e->g = g;
+        e->mtime = pi->modify_time;
+        e->seen = L.pass;
+        custom_apply(e);
+        insert(e);
     } else {
-        free(lg);
+        /* changed (replaced, or written before the year was kept): a new entry
+         * in its place, the old one out of the list but left as it was (the
+         * screen may be drawing it) */
+        LibGame *n = L.n < MAX_GAMES ? calloc(1, sizeof(*n)) : NULL;
+        if (!n) {
+            SDL_UnlockMutex(L.mu);
+            return;
+        }
+        n->g = g;
+        n->mtime = pi->modify_time;
+        n->seen = L.pass;
+        custom_apply(n);
+        e->gone = e->replaced = true;
+        e->dup = false;
+        unsigned h = path_hash(path) & (HASH_SIZE - 1);
+        while (L.by_path[h] != e) {
+            h = (h + 1) & (HASH_SIZE - 1);
+        }
+        L.by_path[h] = n;   /* the file's entry now */
+        insert_sorted(n);
+        dedupe(e);
+        e = n;
     }
+    dedupe(e);
     SDL_UnlockMutex(L.mu);
+    if (SDL_GetAtomicInt(&L.busy)) {
+        SDL_Delay(10);  /* a game is reading its disc meanwhile */
+    }
+}
+
+/* a folder's names, one level (SDL_GlobDirectory goes down the whole tree:
+ * with scan_dir's own going down too, a game a few folders deep was read
+ * once a level, under as many spellings of its path) */
+typedef struct {
+    char **v;
+    int n, cap;
+} Names;
+
+static SDL_EnumerationResult SDLCALL collect_name(void *ud, const char *dir, const char *name)
+{
+    (void)dir;
+    Names *l = ud;
+    if (l->n == l->cap) {
+        const int cap = l->cap ? l->cap * 2 : 64;
+        char **v = realloc(l->v, (size_t)cap * sizeof(*v));
+        if (!v) {
+            return SDL_ENUM_FAILURE;
+        }
+        l->v = v;
+        l->cap = cap;
+    }
+    l->v[l->n] = SDL_strdup(name);
+    l->n += l->v[l->n] != NULL;
+    return scan_stopped() ? SDL_ENUM_SUCCESS : SDL_ENUM_CONTINUE;
 }
 
 static void scan_dir(const char *dir, int depth)
 {
-    if (depth > 6 || SDL_GetAtomicInt(&L.stop)) {
+    if (depth > 6 || scan_stopped()) {
         return;
     }
-    int n = 0;
-    char **names = SDL_GlobDirectory(dir, NULL, 0, &n);
-    for (int i = 0; names && i < n; i++) {
+    Names l = {0};
+    SDL_EnumerateDirectory(dir, collect_name, &l);
+    char **names = l.v;
+    const int n = l.n;
+    for (int i = 0; names && i < n && !scan_stopped(); i++) {
         char p[1200];
         snprintf(p, sizeof(p), "%s%s%s", dir, dir[strlen(dir) - 1] == '/' || dir[strlen(dir) - 1] == '\\' ? "" : "/",
                  names[i]);
@@ -329,44 +603,69 @@ static void scan_dir(const char *dir, int depth)
         }
         if (pi.type == SDL_PATHTYPE_DIRECTORY) {
             scan_dir(p, depth + 1);
-        } else if (pi.type == SDL_PATHTYPE_FILE && is_image_name(names[i]) && pi.size > 1 << 20) {
-            /* foo.iso beside foo.xiso.iso: the XISO */
+        } else if (pi.type == SDL_PATHTYPE_FILE && is_image_name(names[i]) && pi.size > 1 << 20 &&
+                   strlen(p) < sizeof(((XdGame *)0)->path) - 1) {
             add_game(p, &pi);
         }
     }
-    SDL_free(names);
+    for (int i = 0; i < n; i++) {
+        SDL_free(names[i]);
+    }
+    free(names);
 }
-
-typedef struct {
-    char dirs[48][1024];    /* folders, and game files added one by one */
-    int n;
-} ScanArgs;
 
 static int scan_thread(void *arg)
 {
     ScanArgs *a = arg;
-    if (!g_cache) {
-        cache_load();
-    }
-    for (int i = 0; i < a->n; i++) {
-        SDL_PathInfo pi;
-        if (SDL_GetPathInfo(a->dirs[i], &pi) && pi.type == SDL_PATHTYPE_FILE) {
-            add_game(a->dirs[i], &pi);  /* any name: it was chosen */
-        } else {
-            scan_dir(a->dirs[i], 0);
+    for (;;) {
+        bool there[48];
+        for (int i = 0; i < a->n && !L.loaded; i++) {
+            there[i] = SDL_GetPathInfo(a->dirs[i], NULL);
         }
-    }
-    /* games whose files went away */
-    SDL_LockMutex(L.mu);
-    for (int i = 0; i < L.n; i++) {
-        if (!SDL_GetPathInfo(L.games[i]->g.path, NULL)) {
-            L.games[i]->g.path[0] = 0;  /* hidden; freed at shutdown */
+        SDL_LockMutex(L.mu);
+        L.pass++;
+        if (!L.loaded) {
+            L.loaded = true;
+            cache_load(a, there);   /* the library at once, as the last run left it */
         }
+        SDL_UnlockMutex(L.mu);
+        for (int i = 0; i < a->n && !scan_stopped(); i++) {
+            SDL_PathInfo pi;
+            if (SDL_GetPathInfo(a->dirs[i], &pi) && pi.type == SDL_PATHTYPE_FILE) {
+                add_game(a->dirs[i], &pi);  /* any name: it was chosen */
+            } else {
+                scan_dir(a->dirs[i], 0);
+            }
+        }
+        const bool whole = !scan_stopped();
+        SDL_LockMutex(L.mu);
+        if (whole) {
+            /* the files not found this time: gone (away, or their folder left the library) */
+            for (int i = 0; i < L.n; i++) {
+                if (L.games[i]->seen != L.pass || L.games[i]->replaced) {
+                    L.games[i]->gone = true;
+                }
+            }
+            dedupe_all();
+        }
+        ScanArgs *next = SDL_GetAtomicInt(&L.stop) ? NULL : L.pending;
+        if (next) {
+            L.pending = NULL;
+        }
+        SDL_SetAtomicInt(&L.restart, 0);
+        if (!next) {
+            SDL_SetAtomicInt(&L.scanning, 0);
+        }
+        SDL_UnlockMutex(L.mu);
+        if (whole || SDL_GetAtomicInt(&L.stop)) {
+            cache_save(a);  /* closed halfway: what was read so far, for the next start */
+        }
+        free(a);
+        if (!next) {
+            break;
+        }
+        a = next;   /* the folders changed meanwhile: again, with them */
     }
-    SDL_UnlockMutex(L.mu);
-    cache_save();
-    free(a);
-    SDL_SetAtomicInt(&L.scanning, 0);
     return 0;
 }
 
@@ -375,23 +674,38 @@ void lib_scan(const char *const *folders, int n)
     if (!L.mu) {
         L.mu = SDL_CreateMutex();
     }
-    if (SDL_GetAtomicInt(&L.scanning)) {
+    ScanArgs *a = calloc(1, sizeof(*a));
+    if (!a) {
         return;
     }
-    if (L.scan) {
-        SDL_WaitThread(L.scan, NULL);
-    }
-    ScanArgs *a = calloc(1, sizeof(*a));
     for (int i = 0; i < n && i < 48; i++) {
         snprintf(a->dirs[a->n++], sizeof(a->dirs[0]), "%s", folders[i]);
     }
+    SDL_LockMutex(L.mu);
+    if (SDL_GetAtomicInt(&L.scanning)) {
+        /* one runs: it stops where it is and starts over with these */
+        free(L.pending);
+        L.pending = a;
+        SDL_SetAtomicInt(&L.restart, 1);
+        SDL_UnlockMutex(L.mu);
+        return;
+    }
     SDL_SetAtomicInt(&L.scanning, 1);
+    SDL_UnlockMutex(L.mu);
+    if (L.scan) {
+        SDL_WaitThread(L.scan, NULL);
+    }
     L.scan = SDL_CreateThread(scan_thread, "lib-scan", a);
 }
 
 bool lib_scanning(void)
 {
     return SDL_GetAtomicInt(&L.scanning) != 0;
+}
+
+void lib_set_busy(bool busy)
+{
+    SDL_SetAtomicInt(&L.busy, busy);
 }
 
 int lib_count(void)
@@ -410,6 +724,9 @@ int lib_count(void)
 
 LibGame *lib_get(int idx)
 {
+    if (!L.mu) {
+        return NULL;
+    }
     LibGame *r = NULL;
     SDL_LockMutex(L.mu);
     for (int i = 0, k = 0; i < L.n; i++) {
@@ -422,32 +739,89 @@ LibGame *lib_get(int idx)
     return r;
 }
 
-SDL_Texture *lib_load_png(const char *path)
+int lib_list(LibGame **out, int max)
+{
+    if (!L.mu) {
+        return 0;
+    }
+    int k = 0;
+    SDL_LockMutex(L.mu);
+    for (int i = 0; i < L.n && k < max; i++) {
+        if (shown(L.games[i])) {
+            out[k++] = L.games[i];
+        }
+    }
+    SDL_UnlockMutex(L.mu);
+    return k;
+}
+
+/* The publishers by the two letters that start their title IDs. */
+static const struct {
+    char code[3];
+    const char *name;
+} k_publishers[] = {
+    {"AC", "Acclaim"}, {"AH", "ARUSH Entertainment"}, {"AQ", "Aqua System"}, {"AS", "ASK"}, {"AT", "Atlus"},
+    {"AV", "Activision"}, {"AY", "Aspyr"}, {"BA", "Bandai"}, {"BL", "Black Box"}, {"BM", "BAM! Entertainment"},
+    {"BR", "Broccoli"}, {"BS", "Bethesda Softworks"}, {"BU", "Bunkasha Games"}, {"BV", "Buena Vista Games"},
+    {"BW", "BBC Multimedia"}, {"BZ", "Blizzard"}, {"CC", "Capcom"}, {"CK", "Kemco"}, {"CM", "Codemasters"},
+    {"CV", "Crave Entertainment"}, {"DC", "DreamCatcher"}, {"DX", "Davilex"}, {"EA", "Electronic Arts"},
+    {"EC", "Encore"}, {"EL", "Enlight Software"}, {"EM", "Empire Interactive"}, {"ES", "Eidos Interactive"},
+    {"FI", "Fox Interactive"}, {"FS", "From Software"}, {"GE", "Genki"}, {"GV", "Groove Games"},
+    {"HE", "Tru Blu"}, {"HP", "Hip Interactive"}, {"HU", "Hudson Soft"}, {"HW", "Highwaymen"},
+    {"IA", "Mad Catz"}, {"IF", "Idea Factory"}, {"IG", "Infogrames"}, {"IL", "Interlex"},
+    {"IM", "Imagine Media"}, {"IO", "Ignition"}, {"IP", "Interplay"}, {"IX", "InXile Entertainment"},
+    {"JA", "Jaleco"}, {"JW", "JoWooD"}, {"KB", "Kemco"}, {"KI", "Kids Station"}, {"KN", "Konami"},
+    {"KO", "KOEI"}, {"KU", "Kobi"}, {"LA", "LucasArts"}, {"LS", "Black Bean Games"}, {"MD", "Metro3D"},
+    {"ME", "Medix"}, {"MI", "Microids"}, {"MJ", "Majesco"}, {"MM", "Myelin Media"}, {"MP", "MediaQuest"},
+    {"MS", "Microsoft"}, {"MW", "Midway"}, {"MX", "Empire Interactive"}, {"NK", "NewKidCo"},
+    {"NL", "NovaLogic"}, {"NM", "Namco"}, {"OX", "Oxygen Interactive"}, {"PC", "Playlogic"},
+    {"PL", "Phantagram"}, {"RA", "Rage"}, {"SA", "Sammy"}, {"SC", "SCi Games"}, {"SE", "SEGA"},
+    {"SN", "SNK"}, {"SS", "Simon & Schuster"}, {"SU", "Success"}, {"SW", "Swing! Deutschland"},
+    {"TA", "Takara"}, {"TC", "Tecmo"}, {"TD", "The 3DO Company"}, {"TK", "Takuyo"},
+    {"TM", "TDK Mediactive"}, {"TQ", "THQ"}, {"TS", "Titus Interactive"}, {"TT", "Take-Two Interactive"},
+    {"US", "Ubisoft"}, {"VC", "Victor Interactive"}, {"VN", "Vivendi Universal"}, {"VU", "Vivendi Universal"},
+    {"WB", "Warner Bros."}, {"WC", "Wizard Corporation"}, {"WR", "Warner Bros."}, {"XI", "XPEC Entertainment"},
+    {"XK", "Xbox Korea"}, {"XM", "Evolved Games"}, {"XP", "XPEC"}, {"XR", "Panorama"}, {"YB", "YBM Sisa"},
+    {"ZD", "Zushi Games"},
+};
+
+const char *lib_publisher(const LibGame *g)
+{
+    const char c[3] = {(char)(g->g.title_id >> 24), (char)(g->g.title_id >> 16), 0};
+    for (size_t i = 0; i < sizeof(k_publishers) / sizeof(k_publishers[0]); i++) {
+        if (!strcmp(k_publishers[i].code, c)) {
+            return k_publishers[i].name;
+        }
+    }
+    return "";
+}
+
+UiTex *lib_load_png(const char *path)
 {
     int w, h, c;
     uint8_t *px = stbi_load(path, &w, &h, &c, 4);
     if (!px) {
         return NULL;
     }
-    SDL_Texture *t = ui_texture_rgba(px, w, h);
+    UiTex *t = ui_texture_rgba(px, w, h);
     stbi_image_free(px);
     return t;
 }
 
-SDL_Texture *lib_icon(LibGame *g)
+UiTex *lib_icon(LibGame *g)
 {
     if (!g->icon_tex) {
         char p[1200];
         icon_path(&g->g, p, sizeof(p));
         g->icon_tex = lib_load_png(p);
         if (!g->icon_tex) {
-            g->icon_tex = (SDL_Texture *)1;    /* none: not looked for again */
+            g->icon_tex = (UiTex *)1;    /* none: not looked for again */
         }
     }
-    return g->icon_tex == (SDL_Texture *)1 ? NULL : g->icon_tex;
+    return g->icon_tex == (UiTex *)1 ? NULL : g->icon_tex;
 }
 
-SDL_Texture *lib_cover(LibGame *g)
+UiTex *lib_cover(LibGame *g)
 {
     if (!g->cover_tex && !g->cover_tried) {
         char p[1200];
@@ -458,20 +832,32 @@ SDL_Texture *lib_cover(LibGame *g)
     return g->cover_tex;
 }
 
+/* the same game as g (its key), not merely two discs that couldn't be read */
+static bool same_game(const LibGame *e, const LibGame *g)
+{
+    return g->g.title_id && !strcmp(e->g.key, g->g.key);
+}
+
 void lib_set_name(LibGame *g, const char *name)
 {
     SDL_LockMutex(L.mu);
     Custom *c = custom_of(g->g.key, true);
     if (c) {
         snprintf(c->name, sizeof(c->name), "%s", name ? name : "");
-        if (c->name[0]) {
-            if (!g->orig[0]) {
-                snprintf(g->orig, sizeof(g->orig), "%s", g->g.title);
+        for (int i = 0; i < L.n; i++) {
+            LibGame *e = L.games[i];
+            if (e != g && !same_game(e, g)) {
+                continue;
             }
-            snprintf(g->g.title, sizeof(g->g.title), "%s", c->name);
-        } else if (g->orig[0]) {
-            snprintf(g->g.title, sizeof(g->g.title), "%s", g->orig);
-            g->orig[0] = 0;
+            if (c->name[0]) {
+                if (!e->orig[0]) {
+                    snprintf(e->orig, sizeof(e->orig), "%s", e->g.title);
+                }
+                snprintf(e->g.title, sizeof(e->g.title), "%s", c->name);
+            } else if (e->orig[0]) {
+                snprintf(e->g.title, sizeof(e->g.title), "%s", e->orig);
+                e->orig[0] = 0;
+            }
         }
         custom_save();
         qsort(L.games, L.n, sizeof(L.games[0]), cmp_title);
@@ -485,8 +871,50 @@ void lib_set_hidden(LibGame *g, bool hidden)
     Custom *c = custom_of(g->g.key, true);
     if (c) {
         c->hidden = hidden;
-        g->hidden = hidden;
+        for (int i = 0; i < L.n; i++) {
+            if (L.games[i] == g || same_game(L.games[i], g)) {
+                L.games[i]->hidden = hidden;
+            }
+        }
         custom_save();
+    }
+    SDL_UnlockMutex(L.mu);
+}
+
+/* L.mu held: the favorite and the time played, the same for every entry
+ * of the game (its other copies) */
+static void custom_sync(const LibGame *g)
+{
+    const Custom *c = custom_of(g->g.key, false);
+    for (int i = 0; i < L.n; i++) {
+        LibGame *e = L.games[i];
+        if (e == g || same_game(e, g)) {
+            e->fav = c && c->fav;
+            e->played = c ? c->played : 0;
+        }
+    }
+}
+
+void lib_set_favorite(LibGame *g, bool fav)
+{
+    SDL_LockMutex(L.mu);
+    Custom *c = custom_of(g->g.key, true);
+    if (c) {
+        c->fav = fav;
+        custom_save();
+        custom_sync(g);
+    }
+    SDL_UnlockMutex(L.mu);
+}
+
+void lib_set_played(LibGame *g)
+{
+    SDL_LockMutex(L.mu);
+    Custom *c = custom_of(g->g.key, true);
+    if (c) {
+        c->played = (int64_t)time(NULL);
+        custom_save();
+        custom_sync(g);
     }
     SDL_UnlockMutex(L.mu);
 }
@@ -508,7 +936,7 @@ bool lib_set_cover_file(LibGame *g, const char *path)
     const bool ok = stbi_write_png(to, w, h, 4, px, w * 4) != 0;
     stbi_image_free(px);
     if (g->cover_tex) {
-        SDL_DestroyTexture(g->cover_tex);
+        ui_texture_free(g->cover_tex);
         g->cover_tex = NULL;
     }
     g->cover_tried = false;
@@ -753,7 +1181,7 @@ static int fetch_thread(void *arg)
             SDL_UnlockMutex(L.mu);
             break;
         }
-        LibGame *g = L.games[L.queue[--L.nq]];
+        LibGame *g = L.queue[--L.nq];
         const int left = L.nq;
         SDL_UnlockMutex(L.mu);
         snprintf(L.status, sizeof(L.status), "%s (%d)", g->g.title, left + 1);
@@ -798,7 +1226,7 @@ void lib_fetch_cover(LibGame *g)
     SDL_LockMutex(L.mu);
     for (int i = 0; i < L.n; i++) {
         if (L.games[i] == g && L.nq < MAX_GAMES) {
-            L.queue[L.nq++] = i;
+            L.queue[L.nq++] = g;
         }
     }
     SDL_UnlockMutex(L.mu);
@@ -811,8 +1239,10 @@ void lib_fetch_all_covers(void)
     for (int i = L.n - 1; i >= 0; i--) {
         char p[1200];
         cover_path(&L.games[i]->g, p, sizeof(p));
-        if (L.games[i]->g.path[0] && !SDL_GetPathInfo(p, NULL) && L.nq < MAX_GAMES) {
-            L.queue[L.nq++] = i;
+        LibGame *g = L.games[i];
+        if (!g->gone && !g->dup && !g->fetch_tried && !SDL_GetPathInfo(p, NULL) && L.nq < MAX_GAMES) {
+            g->fetch_tried = true;      /* once a run (none online: not asked again each scan) */
+            L.queue[L.nq++] = g;
         }
     }
     SDL_UnlockMutex(L.mu);
@@ -827,13 +1257,18 @@ const char *lib_fetch_status(void)
 void lib_poll(void)
 {
     /* covers fetched: their textures reload (cover_tried cleared) */
+    if (!L.mu) {
+        return;
+    }
+    SDL_LockMutex(L.mu);
     for (int i = 0; i < L.n; i++) {
         LibGame *g = L.games[i];
         if (!g->cover_tried && g->cover_tex) {
-            SDL_DestroyTexture(g->cover_tex);
+            ui_texture_free(g->cover_tex);
             g->cover_tex = NULL;
         }
     }
+    SDL_UnlockMutex(L.mu);
 }
 
 void lib_shutdown(void)
@@ -847,13 +1282,16 @@ void lib_shutdown(void)
     }
     for (int i = 0; i < L.n; i++) {
         LibGame *g = L.games[i];
-        if (g->icon_tex && g->icon_tex != (SDL_Texture *)1) {
-            SDL_DestroyTexture(g->icon_tex);
+        if (g->icon_tex && g->icon_tex != (UiTex *)1) {
+            ui_texture_free(g->icon_tex);
         }
         if (g->cover_tex) {
-            SDL_DestroyTexture(g->cover_tex);
+            ui_texture_free(g->cover_tex);
         }
         free(g);
     }
     L.n = 0;
+    memset(L.by_path, 0, sizeof(L.by_path));
+    free(L.pending);
+    L.pending = NULL;
 }

@@ -468,6 +468,12 @@ bool nc_kernel_init(NcKernel *k, NcVm *vm)
             if (strcmp(e->name, "XboxAlternateSignatureKeys") == 0) {
                 k->data_va[e->ordinal] = NC_KERNEL_VA + K_DATA_BIG;
             }
+            /* the public key (0x11C bytes), past the 16 keys: xbased's own,
+             * which the discs' security sectors are signed under (xc.c) */
+            if (strcmp(e->name, "XePublicKeyData") == 0) {
+                k->data_va[e->ordinal] = NC_KERNEL_VA + K_DATA_BIG + 0x100;
+                nc_xc_public_key(nc_vm_host(vm, k->data_va[e->ordinal]));
+            }
         } else {
             uint32_t va = NC_KERNEL_VA + K_TRAMPS + e->ordinal * 8u;
             uint8_t *t = nc_vm_host(vm, va);

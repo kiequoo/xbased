@@ -130,6 +130,8 @@ extern int16_t g_apu_frame6[256][6];
 int apu_out_open(int capacity_bytes, int samples, pthread_cond_t *wake);
 /* the bytes queued */
 int apu_out_queued(void);
+/* the most bytes one callback asked for, past the device's first fills */
+int apu_out_asked_max(void);
 /* one EP frame in (the frame thread: the only producer; there is room) */
 void apu_out_push(const void *frame, int bytes);
 /* debug (HAKUX_APU_STATS): callbacks, and those that came up short, since

@@ -28,9 +28,11 @@
  */
 #include "native/app/app.h"
 #include "native/app/ui/config.h"
+#include "native/app/ui/console_cfg.h"
 #include "native/app/ui/dash.h"
 #include "native/app/ui/i18n.h"
 #include "native/app/ui/input_map.h"
+#include "native/app/ui/ui.h"
 #include "hw/xbox/hle/vk/swapchain.h"
 #include "native/app/ui/xbox_data.h"
 #include "native/app/ui/xemu_import.h"
@@ -70,7 +72,7 @@ void nc_dev_ohci_set_pads(unsigned mask);
 /* hw/xbox/hle/pb/pbmode.h */
 bool hle_pb_active(void);
 
-#define MAX_ARGS 64
+#define MAX_ARGS 512
 
 static NcCore g_core;
 static int g_disc_fd = -1;
@@ -79,8 +81,16 @@ static struct ANativeWindow g_nw;
 static char g_exe_dir[MAX_PATH];
 static char g_data_dir[MAX_PATH]; /* settings, saves, states, the log (cfg_data_dir) */
 static char g_disc[1024];
-static char *g_args[MAX_ARGS];     /* the options, for running again */
+static char *g_args[MAX_ARGS];     /* the options: xbased.ini's, the game's, the command line's */
 static int g_nargs;
+/* The command line's own options, which a run started again gets: the
+ * settings' and the game's are read again by the new run. Passing all of
+ * them on, each run added the settings again: a few relaunches or loaded
+ * states filled the list, and what came last (the state to load, the
+ * relaunch flag) was dropped, so a state loaded restarted the game, and a
+ * title that relaunches (Chicago Enforcer) did so over and over. */
+static char *g_cmdline[MAX_ARGS];
+static int g_ncmdline;
 static int g_ncfg_args;            /* how many of them xbased.ini gave */
 static ImMap g_map;     /* the controls: the game's file over xbased.ini (input_map.h) */
 static char g_key[24];  /* the game's "<TITLE ID>.<version>" */
@@ -100,8 +110,12 @@ static void exe_dir(void)
 
 static void add_arg(const char *a)
 {
+    static bool told;
     if (g_nargs < MAX_ARGS && a && a[0]) {
         g_args[g_nargs++] = strdup(a);
+    } else if (a && a[0] && !told) {
+        told = true;
+        nc_log("hakuX-app", "more than %d options: %s and those after it left out", MAX_ARGS, a);
     }
 }
 
@@ -167,7 +181,7 @@ static bool want_fullscreen(void)
 
 /* The game's own options (games/<TITLE ID>.<version>.ini) after the global
  * ones and before the command line's (which come last and win); the
- * console's language from the interface's when none is set; the dashboard's
+ * console's language and video flags as console_cfg.c keeps them; the dashboard's
  * "uncap=1" as the flag the core takes, "fullscreen" (on unless "=0") once. */
 static void game_options(const char *disc)
 {
@@ -229,10 +243,30 @@ static void game_options(const char *disc)
         }
     }
     i18n_set(opt_value("ui.lang"));     /* the app's messages */
-    const char *lang = opt_value("lang");
-    if (!lang || !strcmp(lang, "auto")) {
-        char a[16];
-        snprintf(a, sizeof(a), "lang=%d", i18n_console_lang());
+    /* The console's language and video flags: what changed in the EEPROM
+     * taken into the global settings first (console_cfg.c), then the
+     * command line's, else the game's own, else the global ones (for "auto"
+     * or none, the interface's language). The game's own language, or the
+     * command line's, is kept even on a disc that seems to lack it. */
+    cc_sync(&global);
+    const char *cl_lang = NULL, *cl_video = NULL;
+    for (int i = 0; i < ncmd; i++) {
+        if (!strncmp(cmdline[i], "lang=", 5)) {
+            cl_lang = cmdline[i] + 5;
+        } else if (!strncmp(cmdline[i], "video=", 6)) {
+            cl_video = cmdline[i] + 6;
+        }
+    }
+    const int asked = cl_lang ? atoi(cl_lang) : cfg_get(&c, "lang") ? atoi(cfg_get(&c, "lang")) : 0;
+    const bool fixed = asked >= 1 && asked <= 9;
+    char a[32];
+    snprintf(a, sizeof(a), "lang=%d", fixed ? asked : cc_lang(&global));
+    add_arg(a);
+    if (fixed) {
+        add_arg("langfixed=1");
+    }
+    if (!cl_video && !cfg_get(&c, "video")) {
+        snprintf(a, sizeof(a), "video=0x%x", cc_video(&global));
         add_arg(a);
     }
 }
@@ -294,54 +328,95 @@ static void fatal_box(const char *title, const char *msg)
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, msg, NULL);
 }
 
+static void hold_picture(char *path, size_t n);
+static void wait_next_run(void *ev, void *proc);
+
 /* The process again, with the same disc and options plus extra (minus any
- * earlier option of extra's name). */
-static void run_again(const char *extra)
+ * earlier option of extra's name). hold: the next run shows this one's
+ * picture until its first frame (a state loaded, a title relaunched),
+ * otherwise black (what this one shows at the end of a transition). On
+ * Windows the next run's window comes up under this one, held on top, and
+ * this one goes once that one has drawn: no desktop, nor a window without
+ * the keyboard, between the two. */
+static void run_again(const char *extra, bool hold)
 {
+    nc_kernel_set_paused(&g_core.kernel, true);    /* the picture held is the last one */
+    nc_audio_set_paused(true);
+    char hold_path[MAX_PATH + 32] = "";
+    if (hold) {
+        hold_picture(hold_path, sizeof(hold_path));
+    }
     char cmd[8192];
     char exe[MAX_PATH];
     GetModuleFileNameA(NULL, exe, sizeof(exe));
     int n = snprintf(cmd, sizeof(cmd), "\"%s\" \"%s\"", exe, g_disc[0] ? g_disc : "none");
     const char *eq = extra ? strchr(extra, '=') : NULL;
     const size_t name_len = eq ? (size_t)(eq - extra) : extra ? strlen(extra) : 0;
-    for (int i = 0; i < g_nargs && n < (int)sizeof(cmd) - 8; i++) {
-        if (extra && !strncmp(g_args[i], extra, name_len) &&
-            (g_args[i][name_len] == '=' || g_args[i][name_len] == 0)) {
+    for (int i = 0; i < g_ncmdline && n < (int)sizeof(cmd) - 8; i++) {
+        const char *a = g_cmdline[i];
+        if (extra && !strncmp(a, extra, name_len) && (a[name_len] == '=' || a[name_len] == 0)) {
             continue;
         }
-        if (!strcmp(g_args[i], "relaunch") || !strncmp(g_args[i], "loadstate=", 10)) {
+        if (!a[0] || !strcmp(a, "relaunch") || !strncmp(a, "loadstate=", 10)) {
             continue; /* one run's */
         }
-        n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " \"%s\"", g_args[i]);
+        n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " \"%s\"", a);
     }
     if (extra) {
         n += snprintf(cmd + n, sizeof(cmd) - (size_t)n, " \"%s\"", extra);
     }
     nc_log("hakuX-app", "running again: %s", cmd);
 #ifdef _WIN32
+    SetEnvironmentVariableA("XBASED_HOLD", hold_path[0] ? hold_path : NULL);
+    char ev_name[96];
+    snprintf(ev_name, sizeof(ev_name), "Local\\xbased-ready-%lu-%llu", (unsigned long)GetCurrentProcessId(),
+             (unsigned long long)GetTickCount64());
+    HANDLE ev = CreateEventA(NULL, TRUE, FALSE, ev_name);
+    SetEnvironmentVariableA("XBASED_READY", ev ? ev_name : NULL);
+    char rect[64] = "";
+    if (g_nw.sdl_window && !(SDL_GetWindowFlags(g_nw.sdl_window) & SDL_WINDOW_FULLSCREEN)) {
+        int x = 0, y = 0, w = 0, h = 0;
+        SDL_GetWindowPosition(g_nw.sdl_window, &x, &y);
+        SDL_GetWindowSize(g_nw.sdl_window, &w, &h);
+        snprintf(rect, sizeof(rect), "%d,%d,%d,%d", x, y, w, h);
+    }
+    SetEnvironmentVariableA("XBASED_RECT", rect[0] ? rect : NULL);
+    if (g_nw.hwnd) {
+        SetWindowPos((HWND)g_nw.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
     STARTUPINFOA si = {.cb = sizeof(si)};
     PROCESS_INFORMATION pi;
     if (CreateProcessA(exe, cmd, NULL, NULL, FALSE, 0, NULL, g_exe_dir, &si, &pi)) {
         CloseHandle(pi.hThread);
+        wait_next_run(ev, pi.hProcess);
         CloseHandle(pi.hProcess);
         /* the dashboard waits for this process: the new one's id in the
          * exit code (bit 30 set) lets it follow the game on (dash.c) */
         exit_now((int)(0x40000000u | (pi.dwProcessId & 0x3FFFFFFFu)));
     }
+    if (g_nw.hwnd) {
+        SetWindowPos((HWND)g_nw.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
 #else
+    if (hold_path[0]) {
+        setenv("XBASED_HOLD", hold_path, 1);
+    } else {
+        unsetenv("XBASED_HOLD");
+    }
     /* this process becomes the new run (the same arguments as above) */
     char *argv[MAX_ARGS + 4];
     int k = 0;
     argv[k++] = exe;
     argv[k++] = g_disc[0] ? g_disc : (char *)"none";
-    for (int i = 0; i < g_nargs; i++) {
-        if (extra && !strncmp(g_args[i], extra, name_len) && (g_args[i][name_len] == '=' || g_args[i][name_len] == 0)) {
+    for (int i = 0; i < g_ncmdline; i++) {
+        char *a = g_cmdline[i];
+        if (extra && !strncmp(a, extra, name_len) && (a[name_len] == '=' || a[name_len] == 0)) {
             continue;
         }
-        if (!strcmp(g_args[i], "relaunch") || !strncmp(g_args[i], "loadstate=", 10) || !g_args[i][0]) {
+        if (!a[0] || !strcmp(a, "relaunch") || !strncmp(a, "loadstate=", 10)) {
             continue;
         }
-        argv[k++] = g_args[i];
+        argv[k++] = a;
     }
     if (extra) {
         argv[k++] = (char *)extra;
@@ -512,6 +587,8 @@ static void state_path(int slot, char *out, size_t n)
  * waits for the GPU to park at a frame, which the window's thread presents
  * meanwhile (from that thread, it waited on itself). */
 static SDL_AtomicInt g_saving;
+static SDL_AtomicInt g_saved_slot;  /* for the notice: slot + 1, or -1 not now (overlay_tick) */
+static void notice(const char *text, const char *after_file);
 
 static void *save_thread(void *arg)
 {
@@ -524,8 +601,14 @@ static void *save_thread(void *arg)
         /* its picture: the frame shown, the dashboard's thumbnail */
         char pic[MAX_PATH * 2];
         snprintf(pic, sizeof(pic), "%.*s.bmp", (int)(strlen(path) - 4), path);
+        remove(pic);
         hle_present_shot(pic);
+        /* the notice after the picture: not in it */
+        for (int i = 0; i < 100 && GetFileAttributesA(pic) == INVALID_FILE_ATTRIBUTES; i++) {
+            SDL_Delay(10);
+        }
     }
+    SDL_SetAtomicInt(&g_saved_slot, err ? -1 : slot + 1);
     SDL_SetAtomicInt(&g_saving, 0);
     return NULL;
 }
@@ -534,6 +617,7 @@ static void save_state(int slot)
 {
     if (SDL_GetAtomicInt(&g_core_state) != 1 || !hle_pb_active()) {
         nc_log("hakuX-app", "savestate: not available now");
+        SDL_SetAtomicInt(&g_saved_slot, -1);
         return;
     }
     if (!SDL_CompareAndSwapAtomicInt(&g_saving, 0, 1)) {
@@ -557,7 +641,7 @@ static void load_state(int slot)
         return;
     }
     snprintf(opt, sizeof(opt), "loadstate=%s", path);
-    run_again(opt);
+    run_again(opt, true);
 }
 
 static bool g_uncap;    /* the run's frame rate setting (fast forward goes back to it) */
@@ -576,11 +660,285 @@ static void screenshot(void)
     snprintf(p, sizeof(p), "%s/%s-%04d%02d%02d-%02d%02d%02d.bmp", dir, g_key, t.wYear, t.wMonth, t.wDay, t.wHour,
              t.wMinute, t.wSecond);
     hle_present_shot(p);
+    notice(T(S_SHOT_SAVED), p);
 }
 
-/* The in-game menu: the emulation paused, the presenter off the window (its
- * Vulkan surface dropped) while the dashboard's renderer draws the menu
- * over the last frame; then the presenter takes the window back. */
+/* ------------------------------------------------------------ the overlay */
+
+/* The interface is the game's overlay (ui_init_overlay): its presenter
+ * composites it over the picture in its own window pass, so the window is
+ * never handed to anything else. Up only while something is drawn (the
+ * in-game menu, a transition, a notice); otherwise the presenter draws as
+ * if there were none. */
+static bool g_fx = true;        /* ui.fx: the transitions */
+static UiTex *g_hold;           /* the picture the run before this one left (XBASED_HOLD) */
+static char g_hold_path[MAX_PATH + 32];
+static int g_boot;              /* 0 before the first frame, 1 coming in, 2 done */
+static double g_boot_t0;
+static bool g_ov_up;            /* an overlay of the window loop's is set */
+static char g_notice[200];
+static double g_notice_t0;
+static char g_notice_file[MAX_PATH + 160];  /* shown once this is written (a picture) */
+#ifdef _WIN32
+static HANDLE g_ready_ev;       /* the run before this one waits on it (run_again) */
+#endif
+
+static void ov_present(void)
+{
+    if (g_nw.width <= 0 || !nc_present_frame(&g_nw)) {
+        SDL_Delay(8);
+    }
+}
+
+static void ov_size(int *w, int *h)
+{
+    *w = g_nw.width;
+    *h = g_nw.height;
+}
+
+static bool ov_ok(void)
+{
+    return ui_is_overlay() && hle_ov_ready();
+}
+
+/* A picture of what the window shows now, for the next run (run_again). */
+static void hold_picture(char *path, size_t n)
+{
+    path[0] = 0;
+    if (!ov_ok()) {
+        return;
+    }
+    ui_overlay_off();
+    g_ov_up = false;
+    snprintf(path, n, "%shandoff.bmp", g_data_dir);
+    remove(path);
+    hle_present_shot(path);
+    for (int i = 0; i < 60 && GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES; i++) {
+        ov_present();
+    }
+    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+        path[0] = 0;
+    }
+}
+
+/* The next run's window under this one's until it has drawn (its event),
+ * it ended, or 15 seconds: this window keeps showing what it shows. */
+static void wait_next_run(void *ev, void *proc)
+{
+#ifdef _WIN32
+    const uint64_t until = SDL_GetTicks() + 15000;
+    while (SDL_GetTicks() < until) {
+        if ((ev && WaitForSingleObject((HANDLE)ev, 0) == WAIT_OBJECT_0) ||
+            WaitForSingleObject((HANDLE)proc, 0) == WAIT_OBJECT_0) {
+            break;
+        }
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+        }
+        ov_present();
+    }
+    if (ev) {
+        CloseHandle((HANDLE)ev);
+    }
+#else
+    (void)ev;
+    (void)proc;
+#endif
+}
+
+/* Out of the game: its picture breaks into shards, black behind (what the
+ * dashboard's window, or the next run's, comes up on). */
+static void fx_out(void)
+{
+    if (!ov_ok()) {
+        return;
+    }
+    const double t0 = ui_time();
+    for (;;) {
+        const float k = g_fx ? (float)((ui_time() - t0) / 0.5) : 1.0f;
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+        }
+        nc_auto_tick();     /* scripted pictures of it too */
+        ui_begin();
+        ui_cover(true);
+        ui_fx_shatter(ui_scene(false), k);
+        ui_end();
+        if (k >= 1) {
+            break;
+        }
+    }
+    g_ov_up = true;     /* black stays up */
+}
+
+static void notice(const char *text, const char *after_file)
+{
+    snprintf(g_notice, sizeof(g_notice), "%s", text);
+    snprintf(g_notice_file, sizeof(g_notice_file), "%s", after_file ? after_file : "");
+    g_notice_t0 = after_file ? 0 : ui_time();
+}
+
+/* Each refresh of the window's loop, before it: the overlay it needs, if
+ * any. Before the game's first frame, the picture the run before left (or
+ * black); then that picture fading into the game's, or the game's rushing
+ * in out of white; a notice over the game a moment. */
+static void overlay_tick(void)
+{
+    if (!ui_is_overlay()) {
+        return;
+    }
+    const int saved = SDL_SetAtomicInt(&g_saved_slot, 0);
+    if (saved) {
+        char t[200];
+        if (saved > 0) {
+            snprintf(t, sizeof(t), T(S_STATE_SAVED), saved - 1);
+        } else {
+            snprintf(t, sizeof(t), "%s", T(S_STATE_NOT_NOW));
+        }
+        notice(t, NULL);
+    }
+    if (g_notice_file[0] && GetFileAttributesA(g_notice_file) != INVALID_FILE_ATTRIBUTES) {
+        g_notice_file[0] = 0;   /* written: the notice now, not in the picture */
+        g_notice_t0 = ui_time();
+    }
+    const double now = ui_time();
+    if (g_boot < 2) {
+        const bool shown = nc_present_shown();
+        if (!shown && (g_hold || g_fx)) {
+            ui_begin();
+            if (g_hold) {
+                ui_fill(g_hold, UI_WHITE);
+                /* a while on: darker, and the console's ring turning */
+                const float d = (float)(now - 0.8);
+                if (d > 0) {
+                    ui_rect(0, 0, ui_w(), ui_h(), (UiColor){0, 0, 0, (uint8_t)(d > 1 ? 110 : 110 * d)});
+                    const float a = d > 0.5f ? 1.0f : d * 2;
+                    ui_ring(ui_w() - 64, ui_h() - 64, 22, 22, 0, 3, ui_alpha(UI_GREEN_DIM, 0.6f * a));
+                    const float r = (float)(now * 5.0);
+                    for (int i = 0; i < 3; i++) {
+                        ui_circle(ui_w() - 64 + 22 * cosf(r + i * 0.35f), ui_h() - 64 + 22 * sinf(r + i * 0.35f),
+                                  3.2f - i * 0.6f, ui_alpha(UI_GREEN_HI, a * (1 - i * 0.25f)));
+                    }
+                }
+            }
+            ui_overlay_submit(true);
+            g_ov_up = true;
+            return;
+        }
+        if (shown && g_boot == 0) {
+            g_boot = 1;
+            g_boot_t0 = now;
+        }
+        const double len = g_hold ? 0.3 : 0.42;
+        if (g_boot == 1 && now - g_boot_t0 < len && (g_hold || g_fx)) {
+            const float k = (float)((now - g_boot_t0) / len);
+            ui_begin();
+            if (g_hold) {
+                ui_fill(ui_scene(false), UI_WHITE);
+                ui_fill(g_hold, ui_alpha(UI_WHITE, 1 - k));
+            } else {
+                ui_fx_flash_in(ui_scene(false), k, (UiColor){255, 255, 255, 230});
+            }
+            ui_overlay_submit(true);
+            g_ov_up = true;
+            return;
+        }
+        if (shown || !(g_hold || g_fx)) {
+            g_boot = 2;
+            if (g_hold) {
+                ui_texture_free(g_hold);
+                g_hold = NULL;
+                remove(g_hold_path);
+            }
+        }
+    }
+    if (g_notice[0] && g_notice_t0 > 0 && now - g_notice_t0 < 2.4) {
+        const float t = (float)(now - g_notice_t0);
+        const float a = t < 0.15f ? t / 0.15f : t > 2.0f ? (2.4f - t) / 0.4f : 1.0f;
+        ui_begin();
+        ui_set_alpha(a);
+        const float sz = 22, w = ui_text_width(g_notice, sz, UI_FONT_REGULAR) + 56;
+        const float x = (ui_w() - w) / 2, y = ui_h() - 96 + (1 - a) * 12;
+        ui_round(x, y, w, 46, 23, (UiColor){0x08, 0x16, 0x05, 0xE0});
+        ui_round_outline(x, y, w, 46, 23, 1.5f, ui_alpha(UI_GREEN, 0.7f));
+        ui_glow(x + 24, y + 23, 14, ui_alpha(UI_GREEN, 0.8f));
+        ui_text(x + 40, y + 10, g_notice, sz, UI_FONT_REGULAR, UI_WHITE, UI_ALIGN_LEFT);
+        ui_overlay_submit(false);
+        g_ov_up = true;
+        return;
+    }
+    if (g_notice[0] && g_notice_t0 > 0) {
+        g_notice[0] = 0;
+    }
+    if (g_ov_up) {
+        ui_overlay_off();
+        g_ov_up = false;
+    }
+}
+
+/* What applies at once of the settings (the picture's shape and filters,
+ * the volume): the game's over the global ones. */
+static void apply_cfg(const Config *global, const Config *game, bool sound)
+{
+    const Config *pick[2] = {game, global};
+    for (int k = 1; k >= 0; k--) {
+        const Config *c = pick[k];
+        const char *v;
+        if ((v = cfg_get(c, "aspect"))) {
+            nc_present_set_aspect(!strcmp(v, "4:3") ? NC_ASPECT_4_3 : !strcmp(v, "16:9") ? NC_ASPECT_16_9
+                                  : !strcmp(v, "stretch") ? NC_ASPECT_STRETCH : NC_ASPECT_AUTO);
+        }
+        if ((v = cfg_get(c, "overscan"))) {
+            nc_present_set_overscan(atoi(v));
+        }
+        if ((v = cfg_get(c, "fxaa"))) {
+            nc_present_set_fxaa(atoi(v) != 0);
+        }
+        if ((v = cfg_get(c, "upscale"))) {
+            nc_present_set_upscale(nc_upscale_from_name(v));
+        }
+        if ((v = cfg_get(c, "crt"))) {
+            hle_present_set_crt(atoi(v));
+        }
+        if ((v = cfg_get(c, "showfps"))) {
+            nc_present_set_show_fps(atoi(v) != 0);
+        }
+        if (!sound) {
+            continue;
+        }
+        if ((v = cfg_get(c, "volume"))) {
+            g_volume = atoi(v) / 100.0f;
+            nc_audio_set_volume(g_volume);
+        }
+        if ((v = cfg_get(c, "mutebg"))) {
+            g_mute_bg = atoi(v) != 0;
+        }
+    }
+    g_fx = cfg_bool(global, "ui.fx", true);
+}
+
+/* the menu's settings as they are being changed: the picture under it */
+static void live_cfg(const struct Config *global, const struct Config *game)
+{
+    apply_cfg(global, game, false);
+}
+
+static void quit_to_dash(SDL_Window *win)
+{
+    /* straight out: nothing of the run is taken back first (the
+     * presenter's swapchain, the paused threads), so nothing can hold the
+     * window */
+    nc_log("hakuX-app", "quit to the dashboard");
+    give_foreground(true);
+    SDL_HideWindow(win);
+    exit_now(0);
+}
+
+/* The in-game menu: the emulation paused, the menu drawn by the game's own
+ * presenter over its picture, blurred (the overlay). Without the overlay:
+ * the presenter off the window (its Vulkan surface dropped) while the
+ * dashboard's renderer draws the menu over the last frame; then the
+ * presenter takes the window back. */
 static void ingame_menu(SDL_Window *win, bool *paused, bool minimized)
 {
     if (SDL_GetAtomicInt(&g_core_state) != 1) {
@@ -588,6 +946,43 @@ static void ingame_menu(SDL_Window *win, bool *paused, bool minimized)
     }
     nc_kernel_set_paused(&g_core.kernel, true);
     nc_audio_set_paused(true);
+    int slot = 0;
+    const char *title = strrchr(g_disc, '\\');
+    if (ov_ok()) {
+        ui_overlay_off();
+        g_ov_up = false;
+        g_notice[0] = 0;
+        const int act = dash_ingame(win, g_key, title ? title + 1 : g_disc, NULL, &slot, live_cfg);
+        SDL_HideCursor();
+        nc_auto_resync();
+        if (act == DASH_INGAME_QUIT) {
+            fx_out();
+            quit_to_dash(win);
+        }
+        if (act == DASH_INGAME_RESTART) {
+            fx_out();
+            run_again(NULL, false);
+        }
+        ui_overlay_off();
+        g_ov_up = false;
+        nc_kernel_set_paused(&g_core.kernel, *paused || minimized);
+        nc_audio_set_paused(*paused || minimized);
+        char path[MAX_PATH + 64];
+        snprintf(path, sizeof(path), "%sxbased.ini", g_data_dir);
+        Config global, game;
+        cfg_load(&global, path);
+        snprintf(path, sizeof(path), "%sgames/%s.ini", g_data_dir, g_key);
+        cfg_load(&game, path);
+        im_resolve(&g_map, &global, &game);
+        pads_changed();
+        apply_cfg(&global, &game, true);
+        if (act == DASH_INGAME_SAVE) {
+            save_state(slot);
+        } else if (act == DASH_INGAME_LOAD) {
+            load_state(slot);
+        }
+        return;
+    }
     char pic[MAX_PATH + 32];
     snprintf(pic, sizeof(pic), "%smenu_frame.bmp", g_data_dir);
     remove(pic);
@@ -597,18 +992,10 @@ static void ingame_menu(SDL_Window *win, bool *paused, bool minimized)
         SDL_Delay(5);
     }
     nc_present_frame(NULL);     /* the surface goes */
-    int slot = 0;
-    const char *title = strrchr(g_disc, '\\');
-    const int act = dash_ingame(win, g_key, title ? title + 1 : g_disc, pic, &slot);
+    const int act = dash_ingame(win, g_key, title ? title + 1 : g_disc, pic, &slot, NULL);
     remove(pic);
     if (act == DASH_INGAME_QUIT) {
-        /* straight out: nothing of the run is taken back first (the
-         * presenter's swapchain, the paused threads), so nothing can hold
-         * the window */
-        nc_log("hakuX-app", "quit to the dashboard");
-        give_foreground(true);
-        SDL_HideWindow(win);
-        exit_now(0);
+        quit_to_dash(win);
     }
     SDL_HideCursor();   /* the game doesn't use the mouse; the menu may have shown it */
     nc_auto_resync();
@@ -625,35 +1012,7 @@ static void ingame_menu(SDL_Window *win, bool *paused, bool minimized)
     cfg_load(&game, path);
     im_resolve(&g_map, &global, &game);
     pads_changed();
-    /* what applies at once: the picture's shape and filters, the volume */
-    const Config *pick[2] = {&game, &global};
-    for (int k = 1; k >= 0; k--) {
-        const Config *c = pick[k];
-        const char *v;
-        if ((v = cfg_get(c, "aspect"))) {
-            nc_present_set_aspect(!strcmp(v, "4:3") ? NC_ASPECT_4_3 : !strcmp(v, "16:9") ? NC_ASPECT_16_9
-                                  : !strcmp(v, "stretch") ? NC_ASPECT_STRETCH : NC_ASPECT_AUTO);
-        }
-        if ((v = cfg_get(c, "fxaa"))) {
-            nc_present_set_fxaa(atoi(v) != 0);
-        }
-        if ((v = cfg_get(c, "upscale"))) {
-            nc_present_set_upscale(nc_upscale_from_name(v));
-        }
-        if ((v = cfg_get(c, "crt"))) {
-            hle_present_set_crt(atoi(v));
-        }
-        if ((v = cfg_get(c, "volume"))) {
-            g_volume = atoi(v) / 100.0f;
-            nc_audio_set_volume(g_volume);
-        }
-        if ((v = cfg_get(c, "showfps"))) {
-            nc_present_set_show_fps(atoi(v) != 0);
-        }
-        if ((v = cfg_get(c, "mutebg"))) {
-            g_mute_bg = atoi(v) != 0;
-        }
-    }
+    apply_cfg(&global, &game, true);
     switch (act) {
     case DASH_INGAME_SAVE:
         save_state(slot);
@@ -662,7 +1021,7 @@ static void ingame_menu(SDL_Window *win, bool *paused, bool minimized)
         load_state(slot);
         break;
     case DASH_INGAME_RESTART:
-        run_again(NULL);
+        run_again(NULL, false);
         break;
     default:
         break;
@@ -744,7 +1103,7 @@ static const char *pick_disc(void)
 }
 
 #ifndef XBASED_VERSION
-#define XBASED_VERSION "1.0.36"
+#define XBASED_VERSION "1.0.55"
 #endif
 #ifdef _WIN32
 #define NC_PLATFORM_NAME "Windows"
@@ -755,7 +1114,6 @@ static const char *pick_disc(void)
 int main(int argc, char *argv[])
 {
     exe_dir();
-    nc_win_mods_cleanup(g_exe_dir);
     read_ini();
     g_ncfg_args = g_nargs;
     const char *disc = NULL;
@@ -765,6 +1123,9 @@ int main(int argc, char *argv[])
             disc = argv[i];
         } else {
             add_arg(argv[i]);
+            if (g_ncmdline < MAX_ARGS && argv[i][0]) {
+                g_cmdline[g_ncmdline++] = strdup(argv[i]);
+            }
         }
     }
     bool again = opt_flag("relaunch");
@@ -776,6 +1137,7 @@ int main(int argc, char *argv[])
         nc_log("hakuX-app", "---- started again (%s)", opt_flag("relaunch") ? "the title's relaunch" : "a state loaded");
     }
     nc_log("hakuX-app", "xbased " XBASED_VERSION " (an original Xbox emulator by crazyriddler, based on hakuX), " NC_PLATFORM_NAME);
+    nc_win_mods_cleanup(g_exe_dir);     /* what an update took away (win_mods.h) */
 
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 #ifndef _WIN32
@@ -881,6 +1243,8 @@ int main(int argc, char *argv[])
                                   : !strcmp(v, "16:9")    ? NC_ASPECT_16_9
                                   : !strcmp(v, "stretch") ? NC_ASPECT_STRETCH
                                                           : NC_ASPECT_AUTO);
+        } else if (!strncmp(a, "overscan=", 9)) {
+            nc_present_set_overscan(atoi(a + 9));
         } else if (!strncmp(a, "fxaa=", 5)) {
             nc_present_set_fxaa(atoi(a + 5) != 0);
         } else if (!strncmp(a, "upscale=", 8)) {
@@ -920,6 +1284,16 @@ int main(int argc, char *argv[])
         return 1;
     }
     SDL_HideCursor();   /* the game doesn't use the mouse */
+    {
+        /* the run before's window's place (run_again), windowed */
+        const char *r = getenv("XBASED_RECT");
+        int x, y, w, h;
+        if (r && sscanf(r, "%d,%d,%d,%d", &x, &y, &w, &h) == 4 && w > 0 && h > 0 &&
+            !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN)) {
+            SDL_SetWindowSize(win, w, h);
+            SDL_SetWindowPosition(win, x, y);
+        }
+    }
     SDL_PropertiesID props = SDL_GetWindowProperties(win);
     g_nw.hwnd = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
     g_nw.hinstance = SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, NULL);
@@ -931,6 +1305,40 @@ int main(int argc, char *argv[])
 
     if (!nc_present_init()) {
         return 1;
+    }
+    {
+        /* the interface as the game's overlay: the in-game menu, the
+         * transitions, the notices (its fonts beside the executable) */
+        char fonts[MAX_PATH + 16];
+        snprintf(fonts, sizeof(fonts), "%sfonts/", g_exe_dir);
+        if (!ui_init_overlay(fonts, ov_present, ov_size)) {
+            nc_log("hakuX-app", "no overlay: the in-game menu on a renderer of its own");
+        }
+        char path[MAX_PATH + 16];
+        snprintf(path, sizeof(path), "%sxbased.ini", g_data_dir);
+        Config global;
+        cfg_load(&global, path);
+        g_fx = cfg_bool(&global, "ui.fx", true);
+        const char *hp = getenv("XBASED_HOLD");
+        if (hp && hp[0] && ui_is_overlay()) {
+            SDL_Surface *sf = SDL_LoadBMP(hp);
+            if (sf) {
+                g_hold = ui_texture_surface(sf);
+                SDL_DestroySurface(sf);
+                snprintf(g_hold_path, sizeof(g_hold_path), "%s", hp);
+            }
+        }
+#ifdef _WIN32
+        const char *rv = getenv("XBASED_READY");
+        if (rv && rv[0]) {
+            g_ready_ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, rv);
+        }
+        SetEnvironmentVariableA("XBASED_READY", NULL);
+        SetEnvironmentVariableA("XBASED_HOLD", NULL);
+        SetEnvironmentVariableA("XBASED_RECT", NULL);
+#else
+        unsetenv("XBASED_HOLD");
+#endif
     }
     nc_vsync_start();
     nc_auto_init(g_data_dir, save_state, load_state);
@@ -1081,11 +1489,13 @@ int main(int argc, char *argv[])
         const int state = SDL_GetAtomicInt(&g_core_state);
         if (state < 0) {
             if (g_core.kernel.relaunch) {
-                run_again("relaunch");
+                run_again("relaunch", true);
             }
             if (g_core.kernel.quit) {
                 if (g_core.kernel.quit_no_dash) {
                     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "xbased", T(S_NO_DASHBOARD), win);
+                } else {
+                    fx_out();
                 }
                 break;
             }
@@ -1098,9 +1508,17 @@ int main(int argc, char *argv[])
                 }
             }
         }
+        overlay_tick();
         if (minimized || g_nw.width <= 0 || !nc_present_frame(&g_nw)) {
             SDL_Delay(8); /* nothing to wait for the display on */
         }
+#ifdef _WIN32
+        if (g_ready_ev && hle_present_count() > 0) {
+            SetEvent(g_ready_ev);   /* drawn: the run before may go */
+            CloseHandle(g_ready_ev);
+            g_ready_ev = NULL;
+        }
+#endif
     }
     nc_log("hakuX-app", "native core: leaving");
     exit_now(0); /* the core thread has no stop yet */

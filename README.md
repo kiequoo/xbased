@@ -47,24 +47,17 @@ https://github.com/user-attachments/assets/bf62adff-002a-4dc6-9b28-eee775181646
 
 ---
 
-**xbased** is an original Xbox emulator for Windows and Linux, developed by
-**[crazyriddler](https://github.com/crazyriddler)**. Based on
-[hakuX](https://github.com/rfandango/hakuX).
-
-It runs original Xbox games on a PC with a reimplemented Xbox kernel, a
-high-level NV2A renderer on Vulkan and an accurate MCPX audio core, behind a
+**xbased** runs original Xbox games on a PC with a reimplemented Xbox kernel,
+a high-level NV2A renderer on Vulkan and an accurate MCPX audio core, behind a
 console-style front end of its own.
 No BIOS, MCPX ROM or hard-disk image is needed.
-
-xbased is created and maintained by **[crazyriddler](https://github.com/crazyriddler)**:
-the emulator, the dashboard, the game fixes and every release.
 
 ## Download
 
 | Platform | File | |
 |---|---|---|
-| **Windows** 10/11 (x64) | `xbased-1.0.36-windows-x64.zip` | Unzip anywhere and run `xbased.exe`. Portable: everything stays in its folder. |
-| **Linux** (x86-64) | `xbased-1.0.36-x86_64.AppImage` | `chmod +x` it and run. Ubuntu 22.04 or newer, or any distribution of the same age. |
+| **Windows** 10/11 (x64) | `xbased-1.0.55-windows-x64.zip` | Unzip anywhere and run `xbased.exe`. Portable: everything stays in its folder. |
+| **Linux** (x86-64) | `xbased-1.0.55-x86_64.AppImage` | `chmod +x` it and run. Ubuntu 22.04 or newer, or any distribution of the same age. |
 
 Get them from **[Releases](https://github.com/crazyriddler/xbased/releases/latest)**.
 
@@ -94,6 +87,16 @@ xbased doesn't include any copyrighted Xbox software.
 
 ### Your library
 - **Automatic box art** and the discs' own title icons.
+- **Big libraries**: hundreds of games across many folders and drives load
+  in the background (a counter shows how many so far) and are playable as
+  they come; the list is back at once the next time.
+- **Search and filters**: by name, publisher, year and region, typed on the
+  keyboard or on an on-screen keyboard with the gamepad. Order by name
+  (numbers first, then A to Z), publisher or year, and jump between letters
+  with the triggers (Z and C on the keyboard).
+- **Three views**: large covers, small covers or icons with names (the View
+  button or V).
+- **Favorites and the last played first**, each one can be turned off.
 - **A page per game**: play, load a state, settings, patches, controls; rename
   it, pick your own cover image, hide it, or make a **desktop shortcut** that
   starts it straight away (handy for Steam and other front ends).
@@ -206,9 +209,11 @@ xbased doesn't include any copyrighted Xbox software.
 
 1. Download xbased from [Releases](https://github.com/crazyriddler/xbased/releases/latest):
    unzip it anywhere (Windows) or run the AppImage (Linux).
-2. Start it: the dashboard opens. **Settings › Interface › Add folder** and pick
-   the folder with your disc images (or **Add a game file** for a single
-   image).
+2. Start it: the dashboard opens. In **Games**, choose **Add games** (the last
+   card, or A on an empty library) to open the file browser: go to the folder
+   with your disc images and press X to add it, or A on a single image to add
+   just that one. It works with a gamepad, the keyboard or the mouse, and
+   lists every drive or mounted disk with its free space.
 3. Choose a game in **Games**. Box art downloads automatically (it can be
    turned off).
 

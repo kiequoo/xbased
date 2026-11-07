@@ -284,6 +284,8 @@ void im_resolve(ImMap *m, const Config *global, const Config *game)
     }
     const Config *dz = game && cfg_get(game, "deadzone") ? game : global;
     m->deadzone = cfg_int(dz, "deadzone", 10) / 100.0f;
+    const Config *ad = game && cfg_get(game, "stick.antidz") ? game : global;
+    m->stick_antidz = cfg_int(ad, "stick.antidz", 0) / 100.0f;
     const Config *sr = game && cfg_get(game, "stick.range") ? game : global;
     m->stick_range = cfg_int(sr, "stick.range", 100) / 100.0f;
     const Config *ss = game && cfg_get(game, "stick.shape") ? game : global;
@@ -318,7 +320,7 @@ static float pad_value(SDL_Gamepad *g, int pad)
  * kept a circle). The range scales the result, for a stick that doesn't
  * reach its edge (above 100%) or games too quick to it (below). Keys
  * already give the square's corners and stay as they are. */
-void im_stick(float x, float y, float dz, float range, bool round, float *ox, float *oy)
+void im_stick(float x, float y, float dz, float antidz, float range, bool round, float *ox, float *oy)
 {
     const float r = sqrtf(x * x + y * y);
     *ox = *oy = 0;
@@ -326,7 +328,12 @@ void im_stick(float x, float y, float dz, float range, bool round, float *ox, fl
         return;
     }
     float len = (r - dz) / (1 - dz);
-    len = (len > 1 ? 1 : len) * range;
+    len = len > 1 ? 1 : len;
+    /* the anti dead zone: past its own dead zone the stick starts at antidz,
+     * not at 0, so a game's dead zone of that size is crossed at once (many
+     * Xbox games ignore the first quarter or more of the travel themselves,
+     * made for the Duke's loose sticks) */
+    len = (antidz + len * (1 - antidz)) * range;
     const float ux = x / r, uy = y / r;
     const float m = round ? 1 : fabsf(ux) > fabsf(uy) ? fabsf(ux) : fabsf(uy);
     const float sx = ux / m * len, sy = uy / m * len;
@@ -351,7 +358,7 @@ float im_trigger(float a, float dz, float full)
 static void stick(const ImMap *m, float xpos, float xneg, float ypos, float yneg, int16_t *ox, int16_t *oy)
 {
     float x, y;
-    im_stick(xpos - xneg, ypos - yneg, m->deadzone, m->stick_range, m->stick_round, &x, &y);
+    im_stick(xpos - xneg, ypos - yneg, m->deadzone, m->stick_antidz, m->stick_range, m->stick_round, &x, &y);
     *ox = (int16_t)(x * 32767);
     *oy = (int16_t)(y * 32767);
 }

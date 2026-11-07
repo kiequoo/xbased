@@ -48,7 +48,7 @@
 #define PS_RAMP 1024            /* a frame's share of the ramp buffer (768 used) */
 
 /* the window's pipelines, then those into images of ours (R8G8B8A8) */
-enum { P_BILINEAR, P_AREA, P_RCAS, P_CRT, P_OSD, P_FXAA, P_EASU, P_COUNT };
+enum { P_BILINEAR, P_AREA, P_RCAS, P_CRT, P_OSD, P_KDOWN, P_KUP, P_FXAA, P_EASU, P_COUNT };
 
 /* An image of ours a pass draws into and the window's pass samples. */
 typedef struct PsImg {
@@ -56,6 +56,7 @@ typedef struct PsImg {
     VkDeviceMemory mem;
     VkImageView view;
     uint32_t w, h;
+    VkFormat fmt;
     uint64_t serial;            /* the frame it holds (0: none) */
     bool fxaa;                  /* FSR's: made from FXAA's */
 } PsImg;
@@ -67,6 +68,13 @@ typedef struct PsFrame {
     VkDescriptorSet set[2];     /* the window pass's, FXAA's */
     uint64_t value;             /* its last submit's on the timeline */
     bool ramp_stale;            /* its share of the ramp buffer is behind */
+    /* the overlay's: the scene's and its blur's sets, the blur passes',
+     * its vertices and the uploads' staging (host-visible, grown) */
+    VkDescriptorSet ovs[2], bset[10];
+    VkBuffer vbuf, stage;
+    VkDeviceMemory vmem, stage_mem;
+    uint8_t *vmap, *stage_map;
+    VkDeviceSize vsize, stage_size;
 } PsFrame;
 
 static struct {
@@ -242,6 +250,53 @@ static const char k_fs_osd[] =
     "  bool lead = n < pw && cell < 3;\n"
     "  float on = lead ? 0.0 : seg(vec2(fract(v_uv.x * 4.0), v_uv.y), SEG[digit]);\n"
     "  o = mix(vec4(0.02, 0.07, 0.01, 1.0), vec4(0.55, 0.95, 0.16, 1.0), on);\n"
+    "}\n";
+/* The overlay's blur of the picture (HLE_OV_SCENE_BLUR): the dual filter
+ * (Marius Bjorge, "Bandwidth-efficient rendering", SIGGRAPH 2015), halving
+ * down a chain of images and doubling back up, five taps down and eight up
+ * each. extra.xy: the offset, a texel of the image read (down) or of the
+ * one drawn (up). No ramp: the picture has it. */
+static const char k_fs_kdown[] =
+    "void main() {\n"
+    "  vec2 h = pc.extra.xy;\n"
+    "  vec3 s = texture(u_tex, v_uv).rgb * 4.0 + texture(u_tex, v_uv - h).rgb + texture(u_tex, v_uv + h).rgb +\n"
+    "           texture(u_tex, v_uv + vec2(h.x, -h.y)).rgb + texture(u_tex, v_uv - vec2(h.x, -h.y)).rgb;\n"
+    "  o = vec4(s / 8.0, 1.0);\n"
+    "}\n";
+static const char k_fs_kup[] =
+    "void main() {\n"
+    "  vec2 h = pc.extra.xy;\n"
+    "  vec3 s = texture(u_tex, v_uv + vec2(-h.x * 2.0, 0.0)).rgb + texture(u_tex, v_uv + vec2(0.0, h.y * 2.0)).rgb +\n"
+    "           texture(u_tex, v_uv + vec2(h.x * 2.0, 0.0)).rgb + texture(u_tex, v_uv + vec2(0.0, -h.y * 2.0)).rgb +\n"
+    "           (texture(u_tex, v_uv + vec2(-h.x, h.y)).rgb + texture(u_tex, v_uv + vec2(h.x, h.y)).rgb +\n"
+    "            texture(u_tex, v_uv + vec2(h.x, -h.y)).rgb + texture(u_tex, v_uv + vec2(-h.x, -h.y)).rgb) * 2.0;\n"
+    "  o = vec4(s / 12.0, 1.0);\n"
+    "}\n";
+/* The overlay's triangles (HleOvVert): window pixels into clip space
+ * (rect.xy: 2 / the window's size), turned as the window's (rot); texel
+ * times colour. */
+static const char k_vs_ov[] =
+    "#version 450\n"
+    "layout(push_constant) uniform P { vec4 rect; vec4 extra; vec4 rot; } pc;\n"
+    "layout(location = 0) in vec2 a_pos;\n"
+    "layout(location = 1) in vec2 a_uv;\n"
+    "layout(location = 2) in vec4 a_col;\n"
+    "layout(location = 0) out vec2 v_uv;\n"
+    "layout(location = 1) out vec4 v_col;\n"
+    "void main() {\n"
+    "  v_uv = a_uv;\n"
+    "  v_col = a_col;\n"
+    "  vec2 p = a_pos * pc.rect.xy - 1.0;\n"
+    "  gl_Position = vec4(pc.rot.x * p.x + pc.rot.y * p.y, pc.rot.z * p.x + pc.rot.w * p.y, 0.0, 1.0);\n"
+    "}\n";
+static const char k_fs_ov[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D u_tex;\n"
+    "layout(location = 0) in vec2 v_uv;\n"
+    "layout(location = 1) in vec4 v_col;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() {\n"
+    "  o = texture(u_tex, v_uv) * v_col;\n"
     "}\n";
 /* FXAA 3.11 Quality as PCSX2 tunes it (edges only: no subpixel blur), into
  * a frame-sized image: no ramp yet. */
@@ -563,8 +618,8 @@ static bool init(void)
         f->ramp_stale = true;
     }
     g_ps.vs = module(HLE_SHADER_VERTEX, k_vs, "");
-    static const char *const body[P_COUNT] = { k_fs_bilinear, k_fs_area, k_fs_rcas, k_fs_crt, k_fs_osd, k_fs_fxaa,
-                                               k_fs_easu };
+    static const char *const body[P_COUNT] = { k_fs_bilinear, k_fs_area, k_fs_rcas, k_fs_crt, k_fs_osd,
+                                               k_fs_kdown, k_fs_kup, k_fs_fxaa, k_fs_easu };
     for (unsigned i = 0; i < P_COUNT; i++) {
         g_ps.fs[i] = module(HLE_SHADER_FRAGMENT, k_fs_head, body[i]);
     }
@@ -872,9 +927,11 @@ static void shot_write(uint32_t w, uint32_t h)
     T.vkUnmapMemory(g_hvk.dev, g_ps.shot_mem);
 }
 
+static bool ov_on(void);
+
 bool hle_present_unchanged(struct ANativeWindow *win, uint64_t key)
 {
-    if (g_ps.shot_want || !g_ps.shown || !win || win != g_ps.win || g_ps.stale || !g_ps.sc || key != g_ps.shown_key ||
+    if (ov_on() || g_ps.shot_want || !g_ps.shown || !win || win != g_ps.win || g_ps.stale || !g_ps.sc || key != g_ps.shown_key ||
         (uint32_t)ANativeWindow_getWidth(win) != g_ps.wsize.width ||
         (uint32_t)ANativeWindow_getHeight(win) != g_ps.wsize.height || hle_disp_gamma_seq() != g_ps.ramp_gen) {
         return false;
@@ -996,9 +1053,9 @@ bool hle_present_frame(uint32_t *w, uint32_t *h)
 
 /* Image t at w x h (FXAA's at the frame's size, FSR's at the frame's in the
  * window), made again when that changes; false when it can't be. */
-static bool img_target(PsImg *t, uint32_t w, uint32_t h, const char *what)
+static bool img_target(PsImg *t, uint32_t w, uint32_t h, VkFormat fmt, const char *what)
 {
-    if (t->img && t->w == w && t->h == h) {
+    if (t->img && t->w == w && t->h == h && t->fmt == fmt) {
         return true;
     }
     if (t->img) {
@@ -1010,7 +1067,7 @@ static bool img_target(PsImg *t, uint32_t w, uint32_t h, const char *what)
     }
     VkImageCreateInfo ici = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .format = fmt, .extent = { w, h, 1 }, .mipLevels = 1, .arrayLayers = 1,
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
         .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
@@ -1025,7 +1082,7 @@ static bool img_target(PsImg *t, uint32_t w, uint32_t h, const char *what)
                                  .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
     VkImageViewCreateInfo vci = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = fmt,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
     if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &t->mem) != VK_SUCCESS ||
         T.vkBindImageMemory(g_hvk.dev, t->img, t->mem, 0) != VK_SUCCESS ||
@@ -1037,6 +1094,7 @@ static bool img_target(PsImg *t, uint32_t w, uint32_t h, const char *what)
     }
     t->w = w;
     t->h = h;
+    t->fmt = fmt;
     t->serial = 0;
     return true;
 }
@@ -1056,26 +1114,38 @@ static void barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImage
     T.vkCmdPipelineBarrier2(cb, &di);
 }
 
-/* A quad of pipeline p over rect (clip space) into the rendering open. */
-static void quad(VkCommandBuffer cb, PsFrame *f, unsigned set, VkPipeline p, VkImageView src,
-                 const float pc[12], uint32_t w, uint32_t h)
+/* Set ds to sample src (and the frame's share of the ramp). */
+static void set_src(PsFrame *f, VkDescriptorSet ds, VkImageView src)
 {
     VkDescriptorImageInfo ii = { g_ps.smp, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
     VkDescriptorBufferInfo bi = { g_ps.ubo, (VkDeviceSize)(f - g_ps.fr) * PS_RAMP, 768 };
     VkWriteDescriptorSet wr[2] = {
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = f->set[set], .dstBinding = 0,
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0,
           .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii },
-        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = f->set[set], .dstBinding = 1,
+        { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 1,
           .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &bi } };
     T.vkUpdateDescriptorSets(g_hvk.dev, 2, wr, 0, NULL);
+}
+
+/* A quad of pipeline p over rect (clip space) into the rendering open. */
+static void quad_ds(VkCommandBuffer cb, PsFrame *f, VkDescriptorSet ds, VkPipeline p, VkImageView src,
+                    const float pc[12], uint32_t w, uint32_t h)
+{
+    set_src(f, ds, src);
     VkViewport vp = { 0, 0, (float)w, (float)h, 0.0f, 1.0f };
     VkRect2D sc = { { 0, 0 }, { w, h } };
     T.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     T.vkCmdSetViewport(cb, 0, 1, &vp);
     T.vkCmdSetScissor(cb, 0, 1, &sc);
-    T.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ps.pl, 0, 1, &f->set[set], 0, NULL);
+    T.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ps.pl, 0, 1, &ds, 0, NULL);
     T.vkCmdPushConstants(cb, g_ps.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
     T.vkCmdDraw(cb, 4, 1, 0, 0);
+}
+
+static void quad(VkCommandBuffer cb, PsFrame *f, unsigned set, VkPipeline p, VkImageView src,
+                 const float pc[12], uint32_t w, uint32_t h)
+{
+    quad_ds(cb, f, f->set[set], p, src, pc, w, h);
 }
 
 static void rendering(VkCommandBuffer cb, VkImageView v, uint32_t w, uint32_t h, bool clear)
@@ -1092,8 +1162,8 @@ static void rendering(VkCommandBuffer cb, VkImageView v, uint32_t w, uint32_t h,
 
 /* A pass of pipeline p over all of image t from src (extra: the shader's
  * pc.extra); t is sampled after it. */
-static void img_pass(VkCommandBuffer cb, PsFrame *f, unsigned set, PsImg *t, VkPipeline p, VkImageView src,
-                     const float extra[4])
+static void img_pass_ds(VkCommandBuffer cb, PsFrame *f, VkDescriptorSet ds, PsImg *t, VkPipeline p,
+                        VkImageView src, const float extra[4])
 {
     barrier(cb, t->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1101,11 +1171,17 @@ static void img_pass(VkCommandBuffer cb, PsFrame *f, unsigned set, PsImg *t, VkP
     rendering(cb, t->view, t->w, t->h, false);
     float pc[12] = { -1.0f, -1.0f, 1.0f, 1.0f, 0, 0, 0, 0, 1.0f, 0, 0, 1.0f };
     memcpy(pc + 4, extra, 4 * sizeof(float));
-    quad(cb, f, set, p, src, pc, t->w, t->h);
+    quad_ds(cb, f, ds, p, src, pc, t->w, t->h);
     T.vkCmdEndRendering(cb);
     barrier(cb, t->img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+}
+
+static void img_pass(VkCommandBuffer cb, PsFrame *f, unsigned set, PsImg *t, VkPipeline p, VkImageView src,
+                     const float extra[4])
+{
+    img_pass_ds(cb, f, f->set[set], t, p, src, extra);
 }
 
 /* How the frame meets the window, logged when that changes. */
@@ -1125,6 +1201,620 @@ static void log_path(unsigned p, bool fxaa, uint32_t vw, uint32_t vh)
     s_vh = vh;
     hle_log("hakuX-hle-back", "present: %ux%u%s into %ux%u: %s", s_w, s_h, fxaa ? " after FXAA" : "", vw, vh,
             p == P_AREA ? "averaged down" : p == P_RCAS ? "scaled up by FSR" : "bilinear");
+}
+
+/* ---- the overlay (swapchain.h) ----
+ *
+ * The front end's interface as triangles over the picture, in the window
+ * pass itself: textures of its own (uploaded with the refresh that first
+ * draws them), and while it covers the window the picture as a texture too,
+ * drawn into an image of the window's size as the window would show it,
+ * and that blurred (the dual filter's chain, k_fs_kdown/k_fs_kup), both
+ * made again only when the picture or its place changes: under the in-game
+ * menu the game is paused and they are made once. With no overlay set none
+ * of this runs. */
+
+#define OV_TEX_MAX 256
+#define OV_BLUR 5               /* the blur's chain: a half .. a 32nd */
+
+typedef struct OvTex {
+    VkImage img;
+    VkDeviceMemory mem;
+    VkImageView view;
+    VkDescriptorSet set;
+    uint32_t w, h;
+    uint8_t state;              /* 0 free, 1 asked for, 2 made, 3 freed: gone once dead_at is done */
+    bool fresh;                 /* just made: cleared before anything is written */
+    uint64_t dead_at;
+} OvTex;
+
+typedef struct OvPut {
+    uint32_t id, x, y, w, h;
+    uint8_t *px;                /* w * h * 4, packed */
+} OvPut;
+
+static struct {
+    OvTex tex[OV_TEX_MAX];      /* 0: white, 1x1 */
+    OvPut *put;
+    uint32_t nput, cput;
+    HleOvVert *v;
+    HleOvCmd *c;
+    uint32_t nv, cv, nc, cc, flags;
+    bool on, scene, blur;       /* set; its commands sample the picture, its blur */
+    bool inited, ok;
+    bool dirty;                 /* textures to make, write or let go */
+    VkDescriptorPool dp;
+    VkShaderModule vs, fs;
+    VkPipeline pipe[3];
+    VkFormat pipe_fmt;
+    PsImg comp, chain[OV_BLUR];
+    uint64_t comp_key, blur_key;
+    uint64_t presented;
+} g_ov;
+
+static bool ov_on(void)
+{
+    return g_ov.on;
+}
+
+uint64_t hle_present_count(void)
+{
+    return g_ov.presented;
+}
+
+uint32_t hle_ov_tex_new(uint32_t w, uint32_t h)
+{
+    if (!w || !h || w > 8192 || h > 8192) {
+        return 0;
+    }
+    for (uint32_t i = 1; i < OV_TEX_MAX; i++) {
+        OvTex *t = &g_ov.tex[i];
+        if (t->state == 0) {
+            memset(t, 0, sizeof(*t));
+            t->w = w;
+            t->h = h;
+            t->state = 1;
+            g_ov.dirty = true;
+            return i;
+        }
+    }
+    hle_log("hakuX-hle-back", "present: overlay textures all taken");
+    return 0;
+}
+
+void hle_ov_tex_put(uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const void *rgba, uint32_t stride)
+{
+    if (id >= OV_TEX_MAX || (g_ov.tex[id].state != 1 && g_ov.tex[id].state != 2) || !w || !h || !rgba ||
+        x + w > g_ov.tex[id].w || y + h > g_ov.tex[id].h) {
+        return;
+    }
+    if (g_ov.nput == g_ov.cput) {
+        g_ov.cput = g_ov.cput ? g_ov.cput * 2 : 64;
+        g_ov.put = g_renew(OvPut, g_ov.put, g_ov.cput);
+    }
+    OvPut *p = &g_ov.put[g_ov.nput++];
+    g_ov.dirty = true;
+    p->id = id;
+    p->x = x;
+    p->y = y;
+    p->w = w;
+    p->h = h;
+    p->px = g_malloc((size_t)w * h * 4);
+    for (uint32_t r = 0; r < h; r++) {
+        memcpy(p->px + (size_t)r * w * 4, (const uint8_t *)rgba + (size_t)r * stride, (size_t)w * 4);
+    }
+}
+
+void hle_ov_tex_free(uint32_t id)
+{
+    if (id == 0 || id >= OV_TEX_MAX) {
+        return;
+    }
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < g_ov.nput; i++) {   /* its uploads go; the others keep their order */
+        if (g_ov.put[i].id == id) {
+            g_free(g_ov.put[i].px);
+        } else {
+            g_ov.put[k++] = g_ov.put[i];
+        }
+    }
+    g_ov.nput = k;
+    OvTex *t = &g_ov.tex[id];
+    if (t->state == 1) {
+        t->state = 0;
+    } else if (t->state == 2) {
+        t->state = 3;
+        t->dead_at = g_ps.submitted;    /* the last submit that may sample it */
+        g_ov.dirty = true;
+    }
+}
+
+void hle_present_set_overlay(const HleOvVert *v, uint32_t nv, const HleOvCmd *c, uint32_t nc, uint32_t flags)
+{
+    g_ps.shown = false;                 /* drawn again, with or without */
+    if (!v || !c || !nv || !nc) {
+        g_ov.on = false;
+        g_ov.nv = g_ov.nc = 0;
+        return;
+    }
+    if (nv > g_ov.cv) {
+        g_ov.cv = nv + nv / 2;
+        g_ov.v = g_renew(HleOvVert, g_ov.v, g_ov.cv);
+    }
+    if (nc > g_ov.cc) {
+        g_ov.cc = nc + nc / 2;
+        g_ov.c = g_renew(HleOvCmd, g_ov.c, g_ov.cc);
+    }
+    memcpy(g_ov.v, v, nv * sizeof(*v));
+    memcpy(g_ov.c, c, nc * sizeof(*c));
+    g_ov.nv = nv;
+    g_ov.nc = nc;
+    g_ov.flags = flags;
+    g_ov.scene = g_ov.blur = false;
+    for (uint32_t i = 0; i < nc; i++) {
+        g_ov.scene |= c[i].tex == HLE_OV_SCENE;
+        g_ov.blur |= c[i].tex == HLE_OV_SCENE_BLUR;
+    }
+    g_ov.on = true;
+}
+
+static VkPipeline ov_pipeline(VkFormat fmt, uint32_t blend)
+{
+    VkPipelineShaderStageCreateInfo st[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = g_ov.vs, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = g_ov.fs, .pName = "main" } };
+    VkVertexInputBindingDescription vb = { 0, sizeof(HleOvVert), VK_VERTEX_INPUT_RATE_VERTEX };
+    VkVertexInputAttributeDescription va[3] = {
+        { 0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(HleOvVert, x) },
+        { 1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(HleOvVert, u) },
+        { 2, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(HleOvVert, rgba) } };
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .vertexBindingDescriptionCount = 1,
+        .pVertexBindingDescriptions = &vb, .vertexAttributeDescriptionCount = 3, .pVertexAttributeDescriptions = va };
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+    VkPipelineViewportStateCreateInfo vp = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1 };
+    VkPipelineRasterizationStateCreateInfo rs = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1.0f };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+    /* straight alpha (SDL's BLEND), added light (ADD), premultiplied */
+    VkPipelineColorBlendAttachmentState ba = {
+        .blendEnable = VK_TRUE, .colorBlendOp = VK_BLEND_OP_ADD, .alphaBlendOp = VK_BLEND_OP_ADD,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA, .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE, .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorWriteMask = 0xF };
+    if (blend == HLE_OV_ADD) {
+        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    } else if (blend == HLE_OV_PREMUL) {
+        ba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    }
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &ba };
+    VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo ds = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn };
+    VkPipelineRenderingCreateInfo rci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+        .pColorAttachmentFormats = &fmt };
+    VkGraphicsPipelineCreateInfo gci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rci, .stageCount = 2, .pStages = st,
+        .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs,
+        .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = g_ps.pl };
+    VkPipeline p = VK_NULL_HANDLE;
+    if (T.vkCreateGraphicsPipelines(g_hvk.dev, VK_NULL_HANDLE, 1, &gci, NULL, &p) != VK_SUCCESS) {
+        p = VK_NULL_HANDLE;
+    }
+    return p;
+}
+
+/* Its descriptor pool (the textures', each frame's), shaders, and white. */
+static bool ov_init(void)
+{
+    if (g_ov.inited) {
+        return g_ov.ok;
+    }
+    g_ov.inited = true;
+    const uint32_t sets = OV_TEX_MAX + PS_FRAMES * 12;
+    VkDescriptorPoolSize ps[2] = { { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sets },
+                                   { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sets } };
+    VkDescriptorPoolCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, .maxSets = sets,
+        .poolSizeCount = 2, .pPoolSizes = ps };
+    if (T.vkCreateDescriptorPool(g_hvk.dev, &pci, NULL, &g_ov.dp) != VK_SUCCESS) {
+        hle_log("hakuX-hle-back", "present: no overlay (descriptor pool)");
+        return false;
+    }
+    for (unsigned i = 0; i < PS_FRAMES; i++) {
+        VkDescriptorSetLayout l[12];
+        for (unsigned k = 0; k < 12; k++) {
+            l[k] = g_ps.dsl;
+        }
+        VkDescriptorSet s[12];
+        VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                            .descriptorPool = g_ov.dp, .descriptorSetCount = 12, .pSetLayouts = l };
+        if (T.vkAllocateDescriptorSets(g_hvk.dev, &dai, s) != VK_SUCCESS) {
+            hle_log("hakuX-hle-back", "present: no overlay (descriptor sets)");
+            return false;
+        }
+        g_ps.fr[i].ovs[0] = s[0];
+        g_ps.fr[i].ovs[1] = s[1];
+        memcpy(g_ps.fr[i].bset, s + 2, sizeof(g_ps.fr[i].bset));
+    }
+    g_ov.vs = module(HLE_SHADER_VERTEX, "", k_vs_ov);
+    g_ov.fs = module(HLE_SHADER_FRAGMENT, "", k_fs_ov);
+    if (!g_ov.vs || !g_ov.fs || !g_ps.pipe[P_KDOWN] || !g_ps.pipe[P_KUP]) {
+        hle_log("hakuX-hle-back", "present: no overlay (shaders)");
+        return false;
+    }
+    g_ov.tex[0] = (OvTex){ .w = 1, .h = 1, .state = 1 };
+    static const uint32_t white = 0xFFFFFFFFu;
+    hle_ov_tex_put(0, 0, 0, 1, 1, &white, 4);
+    g_ov.ok = true;
+    hle_log("hakuX-hle-back", "present: overlay ready");
+    return true;
+}
+
+bool hle_ov_ready(void)
+{
+    return g_ps.inited && !g_ps.failed && g_ps.sc && ov_init();
+}
+
+/* A host-visible buffer of at least need bytes, mapped (a frame's own: its
+ * last submit is done when the frame comes round again). */
+static bool host_buf(VkBuffer *b, VkDeviceMemory *m, uint8_t **map, VkDeviceSize *have, VkDeviceSize need,
+                     VkBufferUsageFlags use)
+{
+    if (*b && *have >= need) {
+        return true;
+    }
+    if (*b) {
+        T.vkDestroyBuffer(g_hvk.dev, *b, NULL);
+        T.vkFreeMemory(g_hvk.dev, *m, NULL);
+        *b = VK_NULL_HANDLE;
+        *map = NULL;
+        *have = 0;
+    }
+    need = MAX(need + need / 2, (VkDeviceSize)65536);
+    VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = need, .usage = use };
+    if (T.vkCreateBuffer(g_hvk.dev, &bci, NULL, b) != VK_SUCCESS) {
+        *b = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements mr;
+    T.vkGetBufferMemoryRequirements(g_hvk.dev, *b, &mr);
+    const int mt = hle_vk_memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, m) != VK_SUCCESS) {
+        T.vkDestroyBuffer(g_hvk.dev, *b, NULL);
+        *b = VK_NULL_HANDLE;
+        return false;
+    }
+    if (T.vkBindBufferMemory(g_hvk.dev, *b, *m, 0) != VK_SUCCESS ||
+        T.vkMapMemory(g_hvk.dev, *m, 0, VK_WHOLE_SIZE, 0, (void **)map) != VK_SUCCESS) {
+        T.vkDestroyBuffer(g_hvk.dev, *b, NULL);
+        T.vkFreeMemory(g_hvk.dev, *m, NULL);
+        *b = VK_NULL_HANDLE;
+        return false;
+    }
+    *have = need;
+    return true;
+}
+
+static bool ov_make(OvTex *t)
+{
+    VkImageCreateInfo ici = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .extent = { t->w, t->h, 1 }, .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
+    if (T.vkCreateImage(g_hvk.dev, &ici, NULL, &t->img) != VK_SUCCESS) {
+        t->img = VK_NULL_HANDLE;
+        return false;
+    }
+    VkMemoryRequirements mr;
+    T.vkGetImageMemoryRequirements(g_hvk.dev, t->img, &mr);
+    const int mt = hle_vk_memtype(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+    VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                 .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt };
+    VkImageViewCreateInfo vci = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = t->img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM, .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+    VkDescriptorSetAllocateInfo dai = { .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                        .descriptorPool = g_ov.dp, .descriptorSetCount = 1,
+                                        .pSetLayouts = &g_ps.dsl };
+    if (mt < 0 || T.vkAllocateMemory(g_hvk.dev, &mai, NULL, &t->mem) != VK_SUCCESS) {
+        T.vkDestroyImage(g_hvk.dev, t->img, NULL);
+        t->img = VK_NULL_HANDLE;
+        return false;
+    }
+    if (T.vkBindImageMemory(g_hvk.dev, t->img, t->mem, 0) != VK_SUCCESS ||
+        T.vkCreateImageView(g_hvk.dev, &vci, NULL, &t->view) != VK_SUCCESS ||
+        T.vkAllocateDescriptorSets(g_hvk.dev, &dai, &t->set) != VK_SUCCESS) {
+        T.vkDestroyImage(g_hvk.dev, t->img, NULL);
+        T.vkFreeMemory(g_hvk.dev, t->mem, NULL);
+        t->img = VK_NULL_HANDLE;
+        return false;
+    }
+    set_src(&g_ps.fr[0], t->set, t->view);
+    t->fresh = true;
+    return true;
+}
+
+static void ov_destroy(OvTex *t)
+{
+    if (t->img) {
+        T.vkFreeDescriptorSets(g_hvk.dev, g_ov.dp, 1, &t->set);
+        T.vkDestroyImageView(g_hvk.dev, t->view, NULL);
+        T.vkDestroyImage(g_hvk.dev, t->img, NULL);
+        T.vkFreeMemory(g_hvk.dev, t->mem, NULL);
+    }
+    memset(t, 0, sizeof(*t));
+}
+
+static bool rects_meet(const OvPut *a, const OvPut *b)
+{
+    return a->x < b->x + b->w && b->x < a->x + a->w && a->y < b->y + b->h && b->y < a->y + a->h;
+}
+
+/* Textures gone, made, cleared and written, before the passes (with no
+ * overlay up too: what one left goes). */
+static void ov_textures(VkCommandBuffer cb, PsFrame *f)
+{
+    g_ov.dirty = false;
+    for (uint32_t i = 1; i < OV_TEX_MAX; i++) {
+        OvTex *t = &g_ov.tex[i];
+        if (t->state == 3) {
+            if (hle_tl_sem_wait(g_ps.tl, t->dead_at, 0) == VK_SUCCESS) {
+                ov_destroy(t);
+            } else {
+                g_ov.dirty = true;      /* still sampled: a later refresh */
+            }
+        }
+    }
+    bool any = false;
+    for (uint32_t i = 0; i < OV_TEX_MAX; i++) {
+        OvTex *t = &g_ov.tex[i];
+        if (t->state == 1) {
+            if (!ov_make(t)) {
+                hle_log("hakuX-hle-back", "present: no %ux%u overlay texture", t->w, t->h);
+            }
+            t->state = 2;               /* drawn as nothing if it failed */
+        }
+        any |= t->fresh;
+    }
+    VkDeviceSize bytes = 0;
+    for (uint32_t i = 0; i < g_ov.nput; i++) {
+        bytes += (VkDeviceSize)g_ov.put[i].w * g_ov.put[i].h * 4;
+    }
+    if (!any && !bytes) {
+        return;
+    }
+    if (bytes && !host_buf(&f->stage, &f->stage_mem, &f->stage_map, &f->stage_size, bytes,
+                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT)) {
+        bytes = 0;                      /* nothing written this refresh: tried again next */
+    }
+    bool touched[OV_TEX_MAX] = { false };
+    for (uint32_t i = 0; i < OV_TEX_MAX; i++) {
+        OvTex *t = &g_ov.tex[i];
+        if (t->img && t->fresh) {
+            barrier(cb, t->img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_NONE, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            static const VkClearColorValue clear = { { 0, 0, 0, 0 } };
+            const VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            T.vkCmdClearColorImage(cb, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &rr);
+            touched[i] = true;
+        }
+    }
+    if (bytes) {
+        for (uint32_t i = 0; i < g_ov.nput; i++) {
+            OvTex *t = &g_ov.tex[g_ov.put[i].id];
+            if (t->img && !touched[g_ov.put[i].id]) {
+                barrier(cb, t->img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                        VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                touched[g_ov.put[i].id] = true;
+            }
+        }
+        /* after the clears; and a write over an earlier one of this batch after it */
+        VkMemoryBarrier2 mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                                .srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                                .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT };
+        VkDependencyInfo di = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1,
+                                .pMemoryBarriers = &mb };
+        if (any) {
+            T.vkCmdPipelineBarrier2(cb, &di);
+        }
+        VkDeviceSize off = 0;
+        for (uint32_t i = 0; i < g_ov.nput; i++) {
+            const OvPut *p = &g_ov.put[i];
+            const VkDeviceSize n = (VkDeviceSize)p->w * p->h * 4;
+            memcpy(f->stage_map + off, p->px, (size_t)n);
+            OvTex *t = &g_ov.tex[p->id];
+            if (t->img) {
+                for (uint32_t j = 0; j < i; j++) {
+                    if (g_ov.put[j].id == p->id && rects_meet(&g_ov.put[j], p)) {
+                        T.vkCmdPipelineBarrier2(cb, &di);
+                        break;
+                    }
+                }
+                VkBufferImageCopy r = { .bufferOffset = off,
+                                        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                                        .imageOffset = { (int32_t)p->x, (int32_t)p->y, 0 },
+                                        .imageExtent = { p->w, p->h, 1 } };
+                T.vkCmdCopyBufferToImage(cb, f->stage, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+            }
+            off += n;
+        }
+        for (uint32_t i = 0; i < g_ov.nput; i++) {
+            g_free(g_ov.put[i].px);
+        }
+        g_ov.nput = 0;
+    }
+    for (uint32_t i = 0; i < OV_TEX_MAX; i++) {
+        if (touched[i]) {
+            barrier(cb, g_ov.tex[i].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            g_ov.tex[i].fresh = false;
+        }
+    }
+}
+
+static uint64_t mix64(uint64_t h, uint64_t v)
+{
+    return (h ^ v) * 0x100000001B3ull;
+}
+
+/* The picture into comp as the window would show it (p over rect from
+ * `from`), and its blur, each when what it shows changed. */
+static void ov_scene(VkCommandBuffer cb, PsFrame *f, unsigned p, const float pc_in[12], VkImageView from,
+                     uint64_t key)
+{
+    const uint32_t ww = g_ps.wsize.width, wh = g_ps.wsize.height;
+    uint64_t k = 0xCBF29CE484222325ull;
+    k = mix64(k, g_ps.have ? g_ps.serial : 0);
+    k = mix64(k, key);
+    k = mix64(k, (uint64_t)ww << 32 | wh);
+    k = mix64(k, g_ps.ramp_gen);
+    k = mix64(k, (uint64_t)g_crt << 32 | (uint64_t)g_ps.fmt);
+    uint32_t sxy[2];
+    memcpy(&sxy[0], &pc_in[2], 4);
+    memcpy(&sxy[1], &pc_in[3], 4);
+    k = mix64(k, (uint64_t)sxy[0] << 32 | sxy[1]);
+    if (!img_target(&g_ov.comp, ww, wh, g_ps.fmt, "overlay")) {
+        return;
+    }
+    if (k != g_ov.comp_key || !g_ov.comp.serial) {
+        barrier(cb, g_ov.comp.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        rendering(cb, g_ov.comp.view, ww, wh, true);
+        if (g_ps.have && g_ps.pipe[p]) {
+            float pc[12];
+            memcpy(pc, pc_in, sizeof(pc));
+            pc[8] = 1.0f;               /* the window's orientation: the overlay turns it */
+            pc[9] = pc[10] = 0.0f;
+            pc[11] = 1.0f;
+            quad(cb, f, 0, g_ps.pipe[p], from, pc, ww, wh);
+        }
+        T.vkCmdEndRendering(cb);
+        barrier(cb, g_ov.comp.img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        g_ov.comp_key = k;
+        g_ov.comp.serial = 1;           /* it holds a picture (made again: 0) */
+    }
+    set_src(f, f->ovs[0], g_ov.comp.view);
+    if (!g_ov.blur) {
+        return;
+    }
+    bool chain = true;
+    for (unsigned i = 0; i < OV_BLUR && chain; i++) {
+        chain = img_target(&g_ov.chain[i], MAX(ww >> (i + 1), 1u), MAX(wh >> (i + 1), 1u), g_ps.fmt, "blur");
+        chain = chain && g_ov.chain[i].serial;
+    }
+    if (k != g_ov.blur_key || !chain) {
+        for (unsigned i = 0; i < OV_BLUR; i++) {
+            if (!img_target(&g_ov.chain[i], MAX(ww >> (i + 1), 1u), MAX(wh >> (i + 1), 1u), g_ps.fmt, "blur")) {
+                return;
+            }
+        }
+        unsigned s = 0;
+        VkImageView src = g_ov.comp.view;
+        uint32_t sw = ww, sh = wh;
+        for (unsigned i = 0; i < OV_BLUR; i++) {      /* down */
+            const float extra[4] = { 1.0f / (float)sw, 1.0f / (float)sh, 0, 0 };
+            img_pass_ds(cb, f, f->bset[s++], &g_ov.chain[i], g_ps.pipe[P_KDOWN], src, extra);
+            src = g_ov.chain[i].view;
+            sw = g_ov.chain[i].w;
+            sh = g_ov.chain[i].h;
+            g_ov.chain[i].serial = 1;
+        }
+        for (int i = OV_BLUR - 2; i >= 0; i--) {     /* and up, into the larger */
+            const float extra[4] = { 1.0f / (float)g_ov.chain[i].w, 1.0f / (float)g_ov.chain[i].h, 0, 0 };
+            img_pass_ds(cb, f, f->bset[s++], &g_ov.chain[i], g_ps.pipe[P_KUP], g_ov.chain[i + 1].view, extra);
+        }
+        g_ov.blur_key = k;
+    }
+    set_src(f, f->ovs[1], g_ov.chain[0].view);
+}
+
+/* The overlay's triangles into the window pass open (iw x ih). */
+static void ov_draw(VkCommandBuffer cb, PsFrame *f, uint32_t iw, uint32_t ih, bool scene_ok)
+{
+    const VkDeviceSize n = (VkDeviceSize)g_ov.nv * sizeof(HleOvVert);
+    if (!host_buf(&f->vbuf, &f->vmem, &f->vmap, &f->vsize, n, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT)) {
+        return;
+    }
+    if (g_ps.fmt != g_ov.pipe_fmt) {
+        for (unsigned i = 0; i < 3; i++) {
+            if (g_ov.pipe[i]) {
+                T.vkDestroyPipeline(g_hvk.dev, g_ov.pipe[i], NULL);
+            }
+            g_ov.pipe[i] = ov_pipeline(g_ps.fmt, i);
+        }
+        g_ov.pipe_fmt = g_ps.fmt;
+    }
+    memcpy(f->vmap, g_ov.v, (size_t)n);
+    const VkDeviceSize zero = 0;
+    T.vkCmdBindVertexBuffers(cb, 0, 1, &f->vbuf, &zero);
+    VkViewport vp = { 0, 0, (float)iw, (float)ih, 0.0f, 1.0f };
+    T.vkCmdSetViewport(cb, 0, 1, &vp);
+    const float ww = (float)g_ps.wsize.width, wh = (float)g_ps.wsize.height;
+    const float pc[12] = { 2.0f / ww, 2.0f / wh, 0, 0, 0, 0, 0, 0, g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
+    const bool turned = g_ps.rot[0] != 1.0f;  /* clips are the window's: kept only unturned */
+    uint32_t bound = ~0u;
+    for (uint32_t i = 0; i < g_ov.nc; i++) {
+        const HleOvCmd *c = &g_ov.c[i];
+        if (!c->count || c->first + c->count > g_ov.nv || c->blend > HLE_OV_PREMUL || !g_ov.pipe[c->blend]) {
+            continue;
+        }
+        VkDescriptorSet ds;
+        if (c->tex == HLE_OV_SCENE || c->tex == HLE_OV_SCENE_BLUR) {
+            if (!scene_ok || (c->tex == HLE_OV_SCENE_BLUR && g_ov.blur_key != g_ov.comp_key)) {
+                continue;
+            }
+            ds = f->ovs[c->tex == HLE_OV_SCENE ? 0 : 1];
+        } else if (c->tex < OV_TEX_MAX && g_ov.tex[c->tex].state == 2 && g_ov.tex[c->tex].img) {
+            ds = g_ov.tex[c->tex].set;
+        } else {
+            continue;
+        }
+        if (c->blend != bound) {
+            T.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ov.pipe[c->blend]);
+            T.vkCmdPushConstants(cb, g_ps.pl, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+            bound = c->blend;
+        }
+        VkRect2D sc = { { 0, 0 }, { iw, ih } };
+        if (c->clip[2] > 0 && c->clip[3] > 0 && !turned) {
+            const int32_t x0 = MAX(c->clip[0], 0), y0 = MAX(c->clip[1], 0);
+            const int32_t x1 = MIN(c->clip[0] + c->clip[2], (int32_t)iw);
+            const int32_t y1 = MIN(c->clip[1] + c->clip[3], (int32_t)ih);
+            if (x1 <= x0 || y1 <= y0) {
+                continue;
+            }
+            sc = (VkRect2D){ { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } };
+        }
+        T.vkCmdSetScissor(cb, 0, 1, &sc);
+        T.vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_ps.pl, 0, 1, &ds, 0, NULL);
+        T.vkCmdDraw(cb, c->count, 1, c->first, 0);
+    }
 }
 
 void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, uint64_t key)
@@ -1163,7 +1853,7 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
      * wait on the render timeline at the frame's value sent the submit down
      * a slow path on Qualcomm's driver (Halo 2 at 30 fps, Adreno 830). */
     if (g_ps.have && fxaa && g_ps.pipe[P_FXAA]) {
-        if (img_target(&g_ps.fx, g_ps.f.w, g_ps.f.h, "FXAA")) {
+        if (img_target(&g_ps.fx, g_ps.f.w, g_ps.f.h, VK_FORMAT_R8G8B8A8_UNORM, "FXAA")) {
             if (g_ps.fx.serial != g_ps.serial) {
                 static const float none[4];
                 img_pass(cb, f, 1, &g_ps.fx, g_ps.pipe[P_FXAA], g_ps.f.view, none);
@@ -1183,7 +1873,7 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
     const bool down = (rx > 1.01f || ry > 1.01f) && average && g_ps.pipe[P_AREA];
     bool fsr = g_ps.have && !down && !g_crt && (rx < 0.99f || ry < 0.99f) && upscale == HLE_UPSCALE_FSR &&
                g_ps.pipe[P_EASU] && g_ps.pipe[P_RCAS];
-    if (fsr && !img_target(&g_ps.up, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f), "FSR")) {
+    if (fsr && !img_target(&g_ps.up, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f), VK_FORMAT_R8G8B8A8_UNORM, "FSR")) {
         g_ps.pipe[P_EASU] = VK_NULL_HANDLE;         /* no image for it: bilinear */
         fsr = false;
     }
@@ -1193,30 +1883,45 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
         g_ps.up.serial = g_ps.serial;
         g_ps.up.fxaa = fxaa_done;
     }
+    /* the picture's pass: p over the frame's place, from `from` */
+    unsigned p = P_BILINEAR;
+    float pc[12] = { -sx, -sy, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f, g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
+    VkImageView from = src;
+    if (down) {
+        p = P_AREA;
+        pc[4] = rx;
+        pc[5] = ry;
+    } else if (fsr) {
+        p = P_RCAS;
+        pc[4] = 0.8705506f;                 /* sharpness 0.2 stops: 2^-0.2 (FsrRcasCon, AMD's sample's) */
+        from = g_ps.up.view;
+    }
+    if (g_crt && g_ps.pipe[P_CRT]) {
+        p = P_CRT;
+        pc[4] = (float)g_crt;
+        pc[5] = (float)hle_host_render_scale();
+        from = src;
+    }
+    /* the overlay: its textures first, the picture as one under a cover */
+    const bool ov = g_ov.on && ov_init();
+    const bool cover = ov && (g_ov.flags & HLE_OV_COVER);
+    bool scene_ok = false;
+    if (ov || (g_ov.ok && g_ov.dirty)) {
+        ov_textures(cb, f);
+    }
+    if (ov) {
+        if (cover && (g_ov.scene || g_ov.blur)) {
+            ov_scene(cb, f, p, pc, from, key);
+            scene_ok = g_ov.comp.serial != 0;
+        }
+    }
     VkImage dst = g_ps.img[g_ps.idx];
     barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     rendering(cb, g_ps.view[g_ps.idx], iw, ih, true);
-    if (g_ps.have) {
-        unsigned p = P_BILINEAR;
-        float pc[12] = { -sx, -sy, sx, sy, 0.0f, 0.0f, 0.0f, 0.0f, g_ps.rot[0], g_ps.rot[1], g_ps.rot[2], g_ps.rot[3] };
-        VkImageView from = src;
-        if (down) {
-            p = P_AREA;
-            pc[4] = rx;
-            pc[5] = ry;
-        } else if (fsr) {
-            p = P_RCAS;
-            pc[4] = 0.8705506f;             /* sharpness 0.2 stops: 2^-0.2 (FsrRcasCon, AMD's sample's) */
-            from = g_ps.up.view;
-        }
-        if (g_crt && g_ps.pipe[P_CRT]) {
-            p = P_CRT;
-            pc[4] = (float)g_crt;
-            pc[5] = (float)hle_host_render_scale();
-        }
-        quad(cb, f, 0, g_ps.pipe[p], p == P_CRT ? src : from, pc, iw, ih);
+    if (g_ps.have && !cover) {
+        quad(cb, f, 0, g_ps.pipe[p], from, pc, iw, ih);
         if (g_osd > 0 && g_ps.pipe[P_OSD]) {
             /* top left, 4 digits each 0.022 of the window's height wide */
             const float dh = 0.045f, dw = dh * 0.62f * (float)wh / (float)ww;
@@ -1225,6 +1930,9 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
             quad(cb, f, 0, g_ps.pipe[P_OSD], src, oc, iw, ih);
         }
         log_path(p, fxaa_done, (uint32_t)(vw + 0.5f), (uint32_t)(vh + 0.5f));
+    }
+    if (ov) {
+        ov_draw(cb, f, iw, ih, scene_ok);
     }
     T.vkCmdEndRendering(cb);
     const bool shot = g_ps.shot_want && g_ps.shot_can && shot_buf((VkDeviceSize)iw * ih * 4);
@@ -1308,6 +2016,7 @@ void hle_present_end(float sx, float sy, bool fxaa, int upscale, bool average, u
     if (pr == VK_SUCCESS || pr == VK_SUBOPTIMAL_KHR) {
         g_ps.shown = true;
         g_ps.shown_key = key;
+        g_ov.presented++;
     }
     if (pr == VK_ERROR_OUT_OF_DATE_KHR || (pr == VK_SUBOPTIMAL_KHR && g_ps.follows)) {
         g_ps.stale = true;

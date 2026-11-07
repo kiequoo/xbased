@@ -63,3 +63,8 @@ One entry per section version (tools/native/statelock.py).
 
 - NcFile.host, old_path: kept by their place in the hdd folder (Partition1/..., .overwrite/...), so a state loads from a copy of the folder elsewhere or on another system (v1..v3 states: the absolute path of the folder they were made in, taken from its PartitionN or .overwrite on)
 - upgraded: v1..v3 states load
+
+## THRD v4 (2026-11-06, after 719a397617)
+
+- a thread keeps up to 64 exception dispatches and unwinds in progress (seh_more holds those past the first 8): Unreal Engine 2 titles rethrow from each guarded function's catch block, XIII 9 deep at boot
+- upgraded: v1..v3 states load

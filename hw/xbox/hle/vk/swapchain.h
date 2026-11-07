@@ -46,4 +46,45 @@ void hle_present_set_crt(int kind);
 /* The frame rate shown in the window's corner, 0 none (any thread). */
 void hle_present_set_osd(float fps);
 
+/* The overlay: the front end's interface composited over the picture by the
+ * presenter itself (the in-game menu, the transitions, notices), so the
+ * window never changes hands. Triangles in window pixels, each command a
+ * run of them with one texture, blending and clip. All of it on the
+ * window's thread, as the refreshes. With none set, a refresh is drawn as
+ * it was before there was one. */
+typedef struct HleOvVert {
+    float x, y, u, v;
+    uint32_t rgba;              /* R | G << 8 | B << 16 | A << 24 */
+} HleOvVert;
+typedef struct HleOvCmd {
+    uint32_t tex;               /* hle_ov_tex_new's, 0 white, or HLE_OV_SCENE* */
+    uint32_t blend;             /* HLE_OV_BLEND, _ADD, _PREMUL */
+    int32_t clip[4];            /* x, y, w, h in window pixels; w 0: none */
+    uint32_t first, count;      /* vertices (three a triangle) */
+} HleOvCmd;
+enum { HLE_OV_BLEND, HLE_OV_ADD, HLE_OV_PREMUL };
+/* the picture as the window would show it this refresh (letterboxed, its
+ * filters, the gamma ramp), and the same blurred: textures of the overlay's
+ * while it covers the window (HLE_OV_COVER) */
+#define HLE_OV_SCENE 0xFFFFFF01u
+#define HLE_OV_SCENE_BLUR 0xFFFFFF02u
+/* the overlay draws the whole window (the picture only where it puts it) */
+#define HLE_OV_COVER 1u
+
+/* A w x h RGBA texture, transparent until written; 0: none left. */
+uint32_t hle_ov_tex_new(uint32_t w, uint32_t h);
+/* Its pixels at x, y (w x h, rows stride bytes apart), copied now and
+ * uploaded with the next refresh. */
+void hle_ov_tex_put(uint32_t id, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const void *rgba, uint32_t stride);
+void hle_ov_tex_free(uint32_t id);
+/* The overlay of the refreshes from the next one (copied), flags HLE_OV_*;
+ * nc 0: none. While one is set every refresh is drawn. */
+void hle_present_set_overlay(const HleOvVert *v, uint32_t nv, const HleOvCmd *c, uint32_t nc, uint32_t flags);
+/* Refreshes presented since the start (one went through: the window shows
+ * the presenter's). */
+uint64_t hle_present_count(void);
+/* The overlay can be drawn (the presenter and its window up, its pipelines
+ * made): on the window's thread. */
+bool hle_ov_ready(void);
+
 #endif

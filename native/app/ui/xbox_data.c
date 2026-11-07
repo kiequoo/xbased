@@ -162,7 +162,9 @@ static bool dir_find(Disc *d, uint32_t sec, uint32_t size, const char *name, uin
     return hit;
 }
 
-static uint8_t *xbe_section(const uint8_t *x, size_t n, const char *want, uint32_t *len)
+/* A section of the XBE whose headers are x (n bytes): its file offset and
+ * size (the names are in the headers). */
+static bool xbe_section(const uint8_t *x, size_t n, const char *want, uint32_t *off, uint32_t *len)
 {
     const uint32_t base = rd32(x + 0x104), nsec = rd32(x + 0x11C), sva = rd32(x + 0x120);
     for (uint32_t i = 0; i < nsec && i < 256; i++) {
@@ -172,12 +174,29 @@ static uint8_t *xbe_section(const uint8_t *x, size_t n, const char *want, uint32
         }
         const uint32_t name_va = rd32(x + so + 0x14), raw = rd32(x + so + 0x0C), rs = rd32(x + so + 0x10);
         const size_t no = name_va - base;
-        if (no + strlen(want) + 1 <= n && !memcmp(x + no, want, strlen(want) + 1) && raw + (size_t)rs <= n) {
+        if (no + strlen(want) + 1 <= n && !memcmp(x + no, want, strlen(want) + 1)) {
+            *off = raw;
             *len = rs;
-            return (uint8_t *)x + raw;
+            return true;
         }
     }
-    return NULL;
+    return false;
+}
+
+/* A time_t's year (UTC), 0 when it isn't one of the Xbox's (2000-2010). */
+static int year_of(uint32_t t)
+{
+    uint32_t days = t / 86400;
+    int y = 1970;
+    for (;;) {
+        const uint32_t len = (y % 4 == 0 && (y % 100 || y % 400 == 0)) ? 366 : 365;
+        if (days < len) {
+            break;
+        }
+        days -= len;
+        y++;
+    }
+    return y >= 2000 && y <= 2010 ? y : 0;
 }
 
 bool xd_read_game(const char *path, XdGame *g)
@@ -211,19 +230,30 @@ bool xd_read_game(const char *path, XdGame *g)
         d.base = k_bases[i];
         found = rd_at(&d, 0x10000, vd, sizeof(vd)) && !memcmp(vd, "MICROSOFT*XBOX*MEDIA", 20);
     }
-    uint32_t sec, size;
+    uint32_t sec, xsize;
     uint8_t *x = NULL;
     bool ok = false;
-    if (found && dir_find(&d, rd32(vd + 20), rd32(vd + 24), "default.xbe", &sec, &size) && size >= 0x200 &&
-        size < 256u << 20) {
-        /* the headers and certificate, then the title image section's bytes */
-        x = malloc(size);
-        if (x && rd_at(&d, (int64_t)sec * 2048, x, size) && !memcmp(x, "XBEH", 4)) {
+    if (found && dir_find(&d, rd32(vd + 20), rd32(vd + 24), "default.xbe", &sec, &xsize) && xsize >= 0x200) {
+        /* the headers (the certificate and the section table are in them),
+         * then the title image section alone: not the whole XBE, megabytes
+         * a game, which made a big library on a hard disk take minutes */
+        uint8_t h0[0x200];
+        uint32_t size = 0;
+        if (rd_at(&d, (int64_t)sec * 2048, h0, sizeof(h0)) && !memcmp(h0, "XBEH", 4)) {
+            size = rd32(h0 + 0x108);    /* the headers' size */
+            size = size < 0x200 ? 0x200 : size > xsize ? xsize : size > (4u << 20) ? 4u << 20 : size;
+            x = malloc(size);
+        }
+        if (x && rd_at(&d, (int64_t)sec * 2048, x, size)) {
             const uint32_t base = rd32(x + 0x104), cert = rd32(x + 0x118) - base;
-            if (cert + 0xB0 <= size) {
+            if (cert < size && size - cert >= 0xB0) {
                 g->title_id = rd32(x + cert + 8);
                 g->regions = rd32(x + cert + 0xA0);
                 g->version = rd32(x + cert + 0xAC);
+                g->year = year_of(rd32(x + cert + 4));
+                if (!g->year) {
+                    g->year = year_of(rd32(x + 0x114));     /* the image's own date */
+                }
                 char name[128];
                 uint16_t u16[40];
                 memcpy(u16, x + cert + 0x0C, sizeof(u16));
@@ -233,7 +263,7 @@ bool xd_read_game(const char *path, XdGame *g)
                 }
                 ok = true;
             }
-            if (cert + 0x1D0 <= size) {
+            if (cert < size && size - cert >= 0x1D0) {
                 memcpy(g->sig_key, x + cert + 0xC0, 16);
                 for (int i = 0; i < 16; i++) {
                     g->alt_ids[i] = rd32(x + cert + 0x5C + i * 4);
@@ -241,14 +271,16 @@ bool xd_read_game(const char *path, XdGame *g)
                 memcpy(g->alt_keys, x + cert + 0xD0, sizeof(g->alt_keys));
                 g->has_keys = true;
             }
-            uint32_t il = 0;
-            uint8_t *img = xbe_section(x, size, "$$XTIMAGE", &il);
-            if (!img) {
-                img = xbe_section(x, size, "$$XSIMAGE", &il);
+            uint32_t il = 0, io = 0;
+            bool has = xbe_section(x, size, "$$XTIMAGE", &io, &il);
+            if (!has) {
+                has = xbe_section(x, size, "$$XSIMAGE", &io, &il);
             }
-            if (img) {
+            uint8_t *img = has && il && il <= (4u << 20) && io + (uint64_t)il <= xsize ? malloc(il) : NULL;
+            if (img && rd_at(&d, (int64_t)sec * 2048 + io, img, il)) {
                 g->icon = xd_xpr_decode(img, il, &g->icon_w, &g->icon_h);
             }
+            free(img);
         }
     }
     free(x);

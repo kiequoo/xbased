@@ -34,6 +34,14 @@ appears in Mods & patches under its file name (`Widescreen_16x9.ips`:
 disc image stays as it is. A patch made for another release of the game
 does nothing useful (or breaks it): match the title ID and version.
 
+The shipped ones (listed in `patches.txt`, from the Xbox graphical patches
+collections) were made and tested on the North American releases. A
+game's releases can share a title ID and still have executables built
+apart, so xbased offers them only on an executable whose certificate says
+it's sold in North America, and only where each record fits its code (a
+record that would cut into an instruction means the patch was made for
+another build). Your own patches are offered as they are.
+
 `tools/mods/ips2mod.py` turns an IPS patch into a `mod.txt`, checking each
 record's bytes against the disc, for one that should refuse the wrong disc.
 Text files are UTF-8. A line whose first non-blank character is `#` is a
@@ -96,8 +104,13 @@ once before the game's entry point. xbased ships a collection in `cheats/`
 beside the executable, by title ID; your own go in `cheats/<TITLE ID>/` in
 the data folder. Each option is a `[cheat]` entry in Mods & patches; the
 game's settings keep them as `xcheat=cheats/<TITLE ID>/<file>|<states>`
-(one `1` or `0` an option). Many check the executable's timestamp first: a
-file made for another release does nothing. `.xbtf` files get the helper
+(one `1` or `0` an option). Nearly all compare the executable's build time
+(its header's) with the builds they were made for before they patch
+anything: xbased reads those builds from each file and offers a file only
+on its own build (the ones that check in a way that can't be read without
+running them are offered, as they still check). Shipped files that don't
+check at all aren't in the collection: they write to fixed places
+whatever the build. `.xbtf` files get the helper
 routines XBMC4Xbox loads for them (the code patch, the hook, the in-game
 key toggles). On the command line: `xcheat=<file>|<states>`.
 

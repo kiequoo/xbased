@@ -24,6 +24,11 @@ void nc_present_set_aspect(int mode);
 /* The console is set to widescreen: auto shows a 4:3-sized frame as 16:9
  * (a widescreen title renders anamorphic into it). */
 void nc_present_set_widescreen(bool on);
+/* Overscan as a TV's: pct percent of the frame hidden past the screen's
+ * edges (a CRT hid some 5-10%: 90% was the classic action-safe area), the
+ * frame grown about its middle to do it; pct < 0 underscan, the frame
+ * shrunk to leave that much border. Any shape (4:3, 16:9, ...). */
+void nc_present_set_overscan(int pct);
 /* FXAA over each frame before it's scaled to the window. */
 void nc_present_set_fxaa(bool on);
 /* The frame rate in the window's corner. */

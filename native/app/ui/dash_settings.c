@@ -3,15 +3,33 @@
  * game's, its mods and cheats, its save states, the controls and their
  * remapping, online play.
  */
+#include "native/app/ui/console_cfg.h"
 #include "native/app/ui/dash_int.h"
 #include "native/app/ui/input_map.h"
+#include "native/app/mod_fit.h"
+#include "native/app/win_mods.h"
 #include "native/core/xcheat.h"
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#ifndef O_BINARY
+#define O_BINARY 0
+#endif
+
+/* a game folder (or file) to take out of the library, once the user says so */
+static char g_unlist[1024], g_unlist_q[1200];
+static bool g_unlist_file;
+
+static void unlist_yes(Dash *d)
+{
+    cfg_remove_value(&d->global, g_unlist_file ? "gamefile" : "gamedir", g_unlist);
+    cfg_save(&d->global);
+}
 
 /* ------------------------------------------------------------ shared rows */
 
@@ -24,6 +42,12 @@ static void rows_video(List *l)
     static const char *av[] = {"auto", "4:3", "16:9", "stretch"};
     const char *an[] = {T(S_AUTO), "4:3", "16:9", T(S_STRETCH)};
     opt_choice(l, S_ASPECT, "aspect", av, an, 4, "auto");
+    /* overscan as a TV's, in any shape: the share of the picture hidden
+     * past the screen's edges (a CRT hid some 5-10%; 7% and 10% the
+     * action-safe areas, EBU's and the classic), or underscan's border */
+    static const char *const ov[] = {"-10", "-5", "-3", "0", "3", "5", "7", "10", "15"};
+    const char *on[] = {"-10%", "-5%", "-3%", T(S_OFF), "3%", "5%", "7%", "10%", "15%"};
+    opt_choice(l, S_OVERSCAN, "overscan", ov, on, 9, "0");
     opt_bool(l, S_FXAA, "fxaa", false, false);
     static const char *anv[] = {"0", "2", "4", "8", "16"};
     const char *ann[] = {T(S_OFF), "2x", "4x", "8x", "16x"};
@@ -53,12 +77,33 @@ static void rows_ram(List *l)
     opt_choice(l, S_RAM_SIZE, "ram", rv, rn, 2, "64");
 }
 
-static void rows_console(List *l)
+/* The console's language: "auto" (the interface's, named) or one; a game's
+ * without "auto", its first choice the global setting (opt_choice). */
+static void rows_language(List *l)
 {
     static const char *lv[] = {"auto", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
-    const char *ln[] = {T(S_AUTO), "English", "日本語", "Deutsch", "Français", "Español", "Italiano", "한국어", "中文",
-                        "Português"};
-    opt_choice(l, S_CONSOLE_LANG, "lang", lv, ln, 10, "auto");
+    static const char *const names[] = {"English", "日本語", "Deutsch", "Français", "Español", "Italiano", "한국어",
+                                        "中文", "Português"};
+    static char auto_name[96];
+    snprintf(auto_name, sizeof(auto_name), "%s · %s", T(S_AUTO), names[i18n_console_lang() - 1]);
+    const char *ln[] = {auto_name, names[0], names[1], names[2], names[3], names[4], names[5], names[6], names[7],
+                        names[8]};
+    if (D.editing_game) {
+        const char *v = cfg_get(&D.game, "lang");
+        if (v && !strcmp(v, "auto")) {
+            cfg_unset(&D.game, "lang");         /* an earlier build's: the global setting */
+        }
+        static char global[4];      /* "global (X)": the language the global setting gives now */
+        snprintf(global, sizeof(global), "%d", cc_lang(&D.global));
+        opt_choice(l, S_CONSOLE_LANG, "lang", lv + 1, ln + 1, 9, global);
+    } else {
+        opt_choice(l, S_CONSOLE_LANG, "lang", lv, ln, 10, "auto");
+    }
+}
+
+static void rows_console(List *l)
+{
+    rows_language(l);
     opt_videoflag(l, S_WIDESCREEN, 0x10000);
 }
 
@@ -95,44 +140,6 @@ static void tab_bar(const enum UiStr *tabs, int n)
     }
 }
 
-/* SDL may call it on a thread of its own: the folder waits for the UI's thread */
-static char g_new_folder[1024];
-static SDL_AtomicInt g_new_folder_set;
-
-void add_folder_cb(void *ud, const char *const *files, int filter)
-{
-    (void)ud;
-    (void)filter;
-    if (files && files[0] && !SDL_GetAtomicInt(&g_new_folder_set)) {
-        snprintf(g_new_folder, sizeof(g_new_folder), "%s", files[0]);
-        SDL_SetAtomicInt(&g_new_folder_set, 1);
-    }
-}
-
-/* a game file: any name (what the folders' scan leaves out: another
- * extension, a folder deeper than it looks) */
-static char g_new_file[1024];
-static SDL_AtomicInt g_new_file_set;
-
-static void SDLCALL add_file_cb(void *ud, const char *const *files, int filter)
-{
-    (void)ud;
-    (void)filter;
-    if (files && files[0] && !SDL_GetAtomicInt(&g_new_file_set)) {
-        snprintf(g_new_file, sizeof(g_new_file), "%s", files[0]);
-        SDL_SetAtomicInt(&g_new_file_set, 1);
-    }
-}
-
-void dash_pick_game_file(void)
-{
-    static const SDL_DialogFileFilter f[] = {
-        {"Xbox disc images (*.iso, *.xiso, *.cci, *.chd)", "iso;xiso;cci;chd"},
-        {"All files", "*"},
-    };
-    SDL_ShowOpenFileDialog(add_file_cb, NULL, SDL_GetKeyboardFocus(), f, 2, NULL, false);
-}
-
 /* a game file played once, not added to the library (the dialog's, or one
  * dropped on the window): started from the UI's thread (dash_take_folder) */
 static char g_play_file[1024];
@@ -157,11 +164,7 @@ static void SDLCALL play_file_cb(void *ud, const char *const *files, int filter)
 
 void dash_pick_play_file(void)
 {
-    static const SDL_DialogFileFilter f[] = {
-        {"Xbox disc images (*.iso, *.xiso, *.cci, *.chd)", "iso;xiso;cci;chd"},
-        {"All files", "*"},
-    };
-    SDL_ShowOpenFileDialog(play_file_cb, NULL, SDL_GetKeyboardFocus(), f, 2, NULL, false);
+    dash_browse_file(T(S_PLAY_GAME_FILE), "iso;xiso;cci;chd", play_file_cb, NULL);
 }
 
 void dash_take_folder(void)
@@ -177,24 +180,6 @@ void dash_take_folder(void)
             dash_toast(T(S_NOT_A_GAME));
         }
         SDL_SetAtomicInt(&g_play_file_set, 0);
-    }
-    if (SDL_GetAtomicInt(&g_new_folder_set)) {
-        cfg_add(&D.global, "gamedir", g_new_folder);
-        cfg_save(&D.global);
-        SDL_SetAtomicInt(&g_new_folder_set, 0);
-    }
-    if (SDL_GetAtomicInt(&g_new_file_set)) {
-        const char *have[32];
-        const int n = cfg_all(&D.global, "gamefile", have, 32);
-        bool dup = false;
-        for (int i = 0; i < n; i++) {
-            dup |= !strcmp(have[i], g_new_file);
-        }
-        if (!dup) {
-            cfg_add(&D.global, "gamefile", g_new_file);
-            cfg_save(&D.global);
-        }
-        SDL_SetAtomicInt(&g_new_file_set, 0);
     }
 }
 
@@ -231,10 +216,7 @@ void scr_settings(void)
         break;
     }
     case 2: {
-        static const char *lv[] = {"auto", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
-        const char *ln[] = {T(S_AUTO), "English", "日本語", "Deutsch", "Français", "Español", "Italiano", "한국어", "中文",
-                            "Português"};
-        opt_choice(&l, S_CONSOLE_LANG, "lang", lv, ln, 10, "auto");
+        rows_language(&l);
         opt_videoflag(&l, S_WIDESCREEN, 0x10000);
         opt_videoflag(&l, S_P480, 0x80000);
         opt_videoflag(&l, S_P720, 0x20000);
@@ -268,26 +250,30 @@ void scr_settings(void)
         }
         opt_bool(&l, S_COVERS_ONLINE, "covers", true, false);
         opt_bool(&l, S_ANIMATED_BG, "ui.anim", true, false);
+        opt_bool(&l, S_TRANSITIONS, "ui.fx", true, false);
         opt_bool(&l, S_UI_SOUNDS, "ui.sounds", true, false);
         opt_bool(&l, S_CHECK_UPDATES, "update.check", true, false);
         opt_bool(&l, S_SWAP_AB, "ui.swapab", false, false);
         opt_bool(&l, S_SHOW_HIDDEN, "ui.showhidden", false, false);
         opt_bool(&l, S_CLOCK_12H, "ui.clock12", false, false);
+        opt_bool(&l, S_FAV_FIRST, "ui.favfirst", true, false);
+        opt_bool(&l, S_LAST_FIRST, "ui.lastfirst", true, false);
         const char *dirs[16];
         const int nd = cfg_all(&D.global, "gamedir", dirs, 16);
         for (int i = 0; i < nd; i++) {
             char label[64];
             snprintf(label, sizeof(label), "%s %d", T(S_GAME_FOLDERS), i + 1);
             if (list_row(&l, label, dirs[i], NULL) || (list_selected(&l) && D.in.x)) {
-                char d[512];
-                snprintf(d, sizeof(d), "%s", dirs[i]);
-                cfg_remove_value(&D.global, "gamedir", d);
-                cfg_save(&D.global);
+                /* out of the library, once asked (a press on it alone used to take it out) */
+                snprintf(g_unlist, sizeof(g_unlist), "%s", dirs[i]);
+                snprintf(g_unlist_q, sizeof(g_unlist_q), T(S_REMOVE_FOLDER_Q), dirs[i]);
+                g_unlist_file = false;
+                dash_ask(g_unlist_q, unlist_yes);
                 break;
             }
         }
-        if (list_row(&l, T(S_ADD_FOLDER), "+", NULL)) {
-            SDL_ShowOpenFolderDialog(add_folder_cb, NULL, SDL_GetKeyboardFocus(), NULL, false);
+        if (list_row(&l, T(S_ADD_GAMES), "+", NULL)) {
+            dash_browse_games();
         }
         const char *files[32];
         const int nf = cfg_all(&D.global, "gamefile", files, 32);
@@ -295,15 +281,12 @@ void scr_settings(void)
             char label[64];
             snprintf(label, sizeof(label), "%s %d", T(S_GAME_FILE), i + 1);
             if (list_row(&l, label, files[i], NULL) || (list_selected(&l) && D.in.x)) {
-                char f[1024];
-                snprintf(f, sizeof(f), "%s", files[i]);
-                cfg_remove_value(&D.global, "gamefile", f);
-                cfg_save(&D.global);
+                snprintf(g_unlist, sizeof(g_unlist), "%s", files[i]);
+                snprintf(g_unlist_q, sizeof(g_unlist_q), T(S_REMOVE_FILE_Q), files[i]);
+                g_unlist_file = true;
+                dash_ask(g_unlist_q, unlist_yes);
                 break;
             }
-        }
-        if (list_row(&l, T(S_ADD_GAME_FILE), "+", NULL)) {
-            dash_pick_game_file();
         }
         if (list_row(&l, T(S_PLAY_GAME_FILE), ">", NULL)) {
             dash_pick_play_file();
@@ -407,10 +390,7 @@ void scr_game_settings(void)
     List l;
     list_begin(&l, 74, 150, W - 148, H - 244, 58);
     rows_video(&l);
-    static const char *lv[] = {"auto", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
-    const char *ln[] = {T(S_AUTO), "English", "日本語", "Deutsch", "Français", "Español", "Italiano", "한국어", "中文",
-                        "Português"};
-    opt_choice(&l, S_CONSOLE_LANG, "lang", lv, ln, 10, "auto");
+    rows_language(&l);
     opt_videoflag(&l, S_WIDESCREEN, 0x10000);
     rows_pal(&l);
     rows_ram(&l);
@@ -451,7 +431,7 @@ typedef struct {
 static XOpt g_xopts[256];
 static int g_nxopts;
 
-static void xcheats_scan(const char *root)
+static void xcheats_scan(const char *root, const FitXbe *xbe)
 {
     char dir[1400];
     snprintf(dir, sizeof(dir), "%scheats/%08X", root, D.cur->g.title_id);
@@ -469,7 +449,10 @@ static void xcheats_scan(const char *root)
         if (dup || !nc_xcheat_load(full, &x)) {
             continue;
         }
-        if (nc_xcheat_for_title(&x, D.cur->g.title_id)) {
+        /* one made for another build (most name theirs) would patch
+         * nothing here: left out */
+        const bool other_build = xbe && !fit_cheat_for_build(x.data, x.size, xbe->time);
+        if (nc_xcheat_for_title(&x, D.cur->g.title_id) && !other_build) {
             for (int o = 0; o < x.nopts && g_nxopts < 256; o++) {
                 XOpt *e = &g_xopts[g_nxopts++];
                 snprintf(e->file, sizeof(e->file), "%s", rel);
@@ -487,9 +470,16 @@ static void xcheats_scan(const char *root)
 static void xcheats_load(void)
 {
     g_nxopts = 0;
-    xcheats_scan(cfg_data_dir());           /* the user's first */
+    /* the disc's executable: its build, for the cheats that check theirs */
+    FitXbe xbe;
+    const int fd = open(D.cur->g.path, O_RDONLY | O_BINARY);
+    const bool have = fd >= 0 && fit_read_xbe(fd, &xbe);
+    if (fd >= 0) {
+        close(fd);
+    }
+    xcheats_scan(cfg_data_dir(), have ? &xbe : NULL);     /* the user's first */
     if (strcmp(cfg_data_dir(), cfg_exe_dir())) {
-        xcheats_scan(cfg_exe_dir());
+        xcheats_scan(cfg_exe_dir(), have ? &xbe : NULL);
     }
 }
 
@@ -549,6 +539,8 @@ static void mods_load(void)
     snprintf(dirs[3], sizeof(dirs[3]), "%smods/%.8s", cfg_data_dir(), D.cur->g.key);
     const char *dir = dirs[0];
     const int ndirs = strcmp(cfg_data_dir(), cfg_exe_dir()) ? 4 : 2;
+    /* the disc, for whether the database's patches fit its executable */
+    const int disc_fd = open(D.cur->g.path, O_RDONLY | O_BINARY);
     for (int di = 0; di < ndirs; di++) {
     int n = 0;
     char **names = SDL_GlobDirectory(dirs[di], NULL, 0, &n);
@@ -564,6 +556,10 @@ static void mods_load(void)
         }
         if (dup) {
             continue;
+        }
+        char why[160] = "";
+        if (ips && !nc_win_mods_ips_fits(cfg_exe_dir(), disc_fd, dirs[di], id, why, sizeof(why))) {
+            continue;       /* made for another release's executable */
         }
         if (ips) {
             /* an IPS patch: its name the file's, underscores as spaces */
@@ -604,6 +600,9 @@ static void mods_load(void)
         SDL_free(t);
     }
     SDL_free(names);
+    }
+    if (disc_fd >= 0) {
+        close(disc_fd);
     }
     /* cheats.txt: its [names] */
     char p[1400];
@@ -813,7 +812,7 @@ void scr_mods(void)
 
 /* ------------------------------------------------------------ save states */
 
-static SDL_Texture *g_thumb[11];
+static UiTex *g_thumb[11];
 static char g_thumb_key[24];
 static int g_del_slot;
 
@@ -829,13 +828,13 @@ static void del_state(Dash *d)
 }
 
 /* a state's picture (the game writes a BMP of its frame) */
-SDL_Texture *load_bmp(const char *path)
+UiTex *load_bmp(const char *path)
 {
     SDL_Surface *s = SDL_LoadBMP(path);
     if (!s) {
         return NULL;
     }
-    SDL_Texture *t = SDL_CreateTextureFromSurface(ui_renderer(), s);
+    UiTex *t = ui_texture_surface(s);
     SDL_DestroySurface(s);
     return t;
 }
@@ -855,7 +854,7 @@ void scr_states(void)
     if (strcmp(g_thumb_key, D.cur->g.key)) {
         for (int i = 0; i < 11; i++) {
             if (g_thumb[i]) {
-                SDL_DestroyTexture(g_thumb[i]);
+                ui_texture_free(g_thumb[i]);
                 g_thumb[i] = NULL;
             }
             char p[1200];
@@ -926,6 +925,35 @@ void scr_controls(void)
     List l;
     list_begin(&l, 74, 150, W - 148, H - 244, 52);
     if (D.editing_game) {
+        /* the game's own sticks (dead zone, anti dead zone, range, shape)
+         * and triggers, on the screens the global ones are set on */
+        char val[128];
+        const Config *dc = cfg_get(&D.game, "deadzone") ? &D.game : &D.global;
+        const Config *ac = cfg_get(&D.game, "stick.antidz") ? &D.game : &D.global;
+        const bool own = cfg_get(&D.game, "deadzone") || cfg_get(&D.game, "stick.antidz") ||
+                         cfg_get(&D.game, "stick.range") || cfg_get(&D.game, "stick.shape");
+        if (own) {
+            snprintf(val, sizeof(val), "%d%%  ·  %d%%", cfg_int(dc, "deadzone", 10), cfg_int(ac, "stick.antidz", 0));
+        } else {
+            snprintf(val, sizeof(val), "%s (%d%%  ·  %d%%)", T(S_DEFAULT_GLOBAL), cfg_int(dc, "deadzone", 10),
+                     cfg_int(ac, "stick.antidz", 0));
+        }
+        if (list_row(&l, T(S_STICK_ZONES), val, NULL)) {
+            dash_push(SCR_STICKS);
+        }
+        const Config *tc = cfg_get(&D.game, "trigger.deadzone") ? &D.game : &D.global;
+        const Config *fc = cfg_get(&D.game, "trigger.full") ? &D.game : &D.global;
+        const bool town = cfg_get(&D.game, "trigger.deadzone") || cfg_get(&D.game, "trigger.full");
+        if (town) {
+            snprintf(val, sizeof(val), "%d%%  ·  %d%%", cfg_int(tc, "trigger.deadzone", 10),
+                     cfg_int(fc, "trigger.full", 100));
+        } else {
+            snprintf(val, sizeof(val), "%s (%d%%  ·  %d%%)", T(S_DEFAULT_GLOBAL), cfg_int(tc, "trigger.deadzone", 10),
+                     cfg_int(fc, "trigger.full", 100));
+        }
+        if (list_row(&l, T(S_TRIGGERS), val, NULL)) {
+            dash_push(SCR_TRIGGERS);
+        }
         const bool custom = cfg_bool(&D.game, "map.custom", false);
         if (list_row(&l, T(S_CUSTOM_CONTROLS), custom ? T(S_ON) : T(S_OFF), NULL)) {
             if (custom) {
@@ -982,7 +1010,8 @@ void scr_controls(void)
 static float g_reach[2][STICK_DIRS][2];
 static double g_sticks_seen;
 
-static void stick_box(int s, SDL_Gamepad *pad, float bx, float by, float S, float dz, float range, bool round)
+static void stick_box(int s, SDL_Gamepad *pad, float bx, float by, float S, float dz, float adz, float range,
+                      bool round)
 {
     const float cx = bx + S / 2, cy = by + S / 2, h = S / 2;
     ui_text(cx, by - 30, T(s ? S_IN_RSTICK : S_IN_LSTICK), 20, UI_FONT_BOLD, UI_WHITE, UI_ALIGN_CENTER);
@@ -994,6 +1023,13 @@ static void stick_box(int s, SDL_Gamepad *pad, float bx, float by, float S, floa
     ui_line(bx, cy, bx + S, cy, 1, ui_alpha(UI_GREEN, 0.18f));
     if (dz > 0) {
         ui_ring(cx, cy, dz * h, dz * h, 0, 1.5f, ui_alpha(UI_GREY, 0.5f));
+    }
+    /* the anti dead zone: what the game gets at the least push past the
+     * dead zone, a disc it never sees inside of */
+    if (adz > 0) {
+        const float ar = adz * range * h;
+        ui_circle(cx, cy, ar, ui_alpha(UI_RED, 0.12f));
+        ui_ring(cx, cy, ar, ar, 0, 2, ui_alpha(UI_RED, 0.8f));
     }
     float x = 0, y = 0;
     if (pad) {
@@ -1022,7 +1058,7 @@ static void stick_box(int s, SDL_Gamepad *pad, float bx, float by, float S, floa
         const float *k = g_reach[s][i];
         got[i] = k[0] != 0 || k[1] != 0;
         if (got[i]) {
-            im_stick(k[0], k[1], dz, range, round, &out[i][0], &out[i][1]);
+            im_stick(k[0], k[1], dz, adz, range, round, &out[i][0], &out[i][1]);
             ngot++;
         }
     }
@@ -1073,7 +1109,7 @@ static void stick_box(int s, SDL_Gamepad *pad, float bx, float by, float S, floa
     reach /= STICK_DIRS;
     if (pad) {
         float ox, oy;
-        im_stick(x, y, dz, range, round, &ox, &oy);
+        im_stick(x, y, dz, adz, range, round, &ox, &oy);
         ui_circle(cx + x * h, cy - y * h, 5, ui_alpha(UI_GREY, 0.8f));      /* the stick itself */
         ui_glow(cx + ox * h, cy - oy * h, 22, ui_alpha(UI_GREEN_HI, 0.5f));
         ui_circle(cx + ox * h, cy - oy * h, 8, UI_GREEN_HI);                /* what the game gets */
@@ -1087,7 +1123,7 @@ static void stick_box(int s, SDL_Gamepad *pad, float bx, float by, float S, floa
 void scr_sticks(void)
 {
     const float W = ui_w(), H = ui_h();
-    draw_header(T(S_STICK_RANGE), NULL);
+    draw_header(T(S_STICK_RANGE), D.editing_game && D.cur ? D.cur->g.title : NULL);
     if (ui_time() - g_sticks_seen > 0.5) {
         memset(g_reach, 0, sizeof(g_reach));    /* a fresh look each time it opens */
     }
@@ -1097,34 +1133,56 @@ void scr_sticks(void)
     const bool round = shape && !strcmp(shape, "round");
     const Config *rc = cfg_get(c, "stick.range") ? c : &D.global;
     const Config *dc = cfg_get(c, "deadzone") ? c : &D.global;
+    const Config *ac = cfg_get(c, "stick.antidz") ? c : &D.global;
     const float range = cfg_int(rc, "stick.range", 100) / 100.0f, dz = cfg_int(dc, "deadzone", 10) / 100.0f;
+    const float adz = cfg_int(ac, "stick.antidz", 0) / 100.0f;
 
-    /* the legend: the square, the outline */
+    /* the legend: the square, the outline, the dead zone's ring and the
+     * anti dead zone's disc */
     const float ly = 128;
-    float lx = W / 2 - (ui_text_width(T(S_STICK_NEEDED), 18, UI_FONT_REGULAR) +
-                        ui_text_width(T(S_STICK_REACHED), 18, UI_FONT_REGULAR) + 92) / 2;
-    ui_round_outline(lx, ly + 3, 16, 16, 2, 2, UI_GREEN);
-    lx += 24;
-    lx += ui_text(lx, ly, T(S_STICK_NEEDED), 18, UI_FONT_REGULAR, UI_GREY, UI_ALIGN_LEFT) + 32;
-    ui_line(lx, ly + 11, lx + 22, ly + 11, 2.5f, UI_WHITE);
-    lx += 30;
-    ui_text(lx, ly, T(S_STICK_REACHED), 18, UI_FONT_REGULAR, UI_GREY, UI_ALIGN_LEFT);
+    const enum UiStr leg[4] = {S_STICK_NEEDED, S_STICK_REACHED, S_DEADZONE, S_ANTI_DEADZONE};
+    float lw = 0;
+    for (int i = 0; i < 4; i++) {
+        lw += ui_text_width(T(leg[i]), 16, UI_FONT_REGULAR) + (i ? 54 : 24);
+    }
+    float lx = W / 2 - lw / 2;
+    for (int i = 0; i < 4; i++) {
+        if (i) {
+            lx += 30;
+        }
+        if (i == 0) {
+            ui_round_outline(lx, ly + 2, 16, 16, 2, 2, UI_GREEN);
+        } else if (i == 1) {
+            ui_line(lx, ly + 10, lx + 18, ly + 10, 2.5f, UI_WHITE);
+        } else if (i == 2) {
+            ui_ring(lx + 8, ly + 10, 7, 7, 0, 1.5f, ui_alpha(UI_GREY, 0.8f));
+        } else {
+            ui_circle(lx + 8, ly + 10, 7, ui_alpha(UI_RED, 0.2f));
+            ui_ring(lx + 8, ly + 10, 7, 7, 0, 2, ui_alpha(UI_RED, 0.8f));
+        }
+        lx += 24;
+        lx += ui_text(lx, ly, T(leg[i]), 16, UI_FONT_REGULAR, UI_GREY, UI_ALIGN_LEFT);
+    }
 
     SDL_Gamepad *pad = dash_active_pad();
-    const float S = fminf(220, (W - 200) / 2 - 60), by = 196, gap = fminf(160, W - 2 * S - 200);
+    const float by = 196;
+    /* the boxes as large as the screen leaves above the four settings */
+    const float S = fminf(fminf(220, (W - 200) / 2 - 60), H - by - 96 - 4 * 44 - 70);
+    const float gap = fminf(160, W - 2 * S - 200);
     const float bx0 = W / 2 - S - gap / 2, bx1 = W / 2 + gap / 2;
-    stick_box(0, pad, bx0, by, S, dz, range, round);
-    stick_box(1, pad, bx1, by, S, dz, range, round);
+    stick_box(0, pad, bx0, by, S, dz, adz, range, round);
+    stick_box(1, pad, bx1, by, S, dz, adz, range, round);
     ui_text(W / 2, by + S + 52, T(pad ? S_STICK_ROTATE : S_STICK_NO_PAD), 18, UI_FONT_REGULAR,
             pad ? UI_GREY : UI_RED, UI_ALIGN_CENTER);
 
     List l;
-    list_begin(&l, 74, by + S + 96, W - 148, 3 * 44, 44);
+    list_begin(&l, 74, by + S + 96, W - 148, 4 * 44, 44);
     opt_int(&l, S_STICK_RANGE, "stick.range", 50, 150, 5, 100, "%");
     static const char *const sv[] = {"square", "round"};
     const char *sn[] = {T(S_SHAPE_SQUARE), T(S_SHAPE_ROUND)};
     opt_choice(&l, S_STICK_SHAPE, "stick.shape", sv, sn, 2, "square");
     opt_int(&l, S_DEADZONE, "deadzone", 0, 50, 5, 10, "%");
+    opt_int(&l, S_ANTI_DEADZONE, "stick.antidz", 0, 50, 5, 0, "%");
     list_end(&l);
     if (D.in.x) {
         memset(g_reach, 0, sizeof(g_reach));
@@ -1134,7 +1192,6 @@ void scr_sticks(void)
         dash_pop();
     }
     draw_hints(T(S_CHANGE), T(S_BACK), T(S_CLEAR), NULL);
-    (void)H;
 }
 
 /* ------------------------------------------------------------ the triggers */
@@ -1214,7 +1271,7 @@ static void trigger_bar(int t, SDL_Gamepad *pad, float cx, float by, float BH, f
 void scr_triggers(void)
 {
     const float W = ui_w();
-    draw_header(T(S_TRIGGERS), NULL);
+    draw_header(T(S_TRIGGERS), D.editing_game && D.cur ? D.cur->g.title : NULL);
     if (ui_time() - g_triggers_seen > 0.5) {
         memset(g_tpeak, 0, sizeof(g_tpeak));    /* a fresh look each time it opens */
     }

@@ -1,0 +1,39 @@
+# Cheats left out of the database (they patch without checking the build
+# they were made for): <title id>/<file> <size> <FNV-1a 64>, deleted at
+# start while unchanged (native/app/win_mods.c)
+41430022/REDSTAR.ETM 284 52417aee090aa2c2
+4156000E/True Crimes Streets of LA [plus4] (v0..etm 433 80742df2fc566cef
+41560042/paintball.etm 808 ce6b74287540f78f
+41560045/True Crime NYC p23 pal.etm 1544 8bfcae6c5db7c6ea
+42530005/Morrowind GotY Ed p17 ntsc.etm 1965 e3d24a3e729e5e08
+42560002/Chicken Little p11 ntsc.etm 653 c301174f678c1581
+43430011/EVT-MMAC.ETM 2040 ea7ae9f020a42206
+43430013/Final Fight Streetwise p15 pal.etm 1382 989e1ba9a7f8ef56
+45410079/007 From Russia with Love _9 (NTSC).etm 717 cfa7786691263bd3
+45410079/007 From Russia with Love p5 ntsc.etm 487 fed0eb5bbfb57f5a
+4541007B/XORNFSMW.ETM 1629 1e037af10a909727
+454D0017/BMT2P.ETM 1131 c316d46b0a44d57b
+45530018/25 To Life p5 ntsc.etm 458 fef575c1782c310a
+4756000A/evt-wpath.etm 1407 d8b73c8e43130fb1
+4B4E002D/Castlevania Curse of Darkness p17 pal.etm 2625 aa6a13b998100f5a
+4D530004/h1dev10.etm 1010 097825af4419ba8d
+4D530014/Tao Fang [plus3] (NTSC).etm 348 3da90bc32a6f1ae3
+4D530064/h2dev13.etm 2014 1536249f8ce0bcc8
+4D570023/Mortal Kombat Deception p11 pal.etm 2305 3ae0cba1f1a272e4
+4D570033/Gauntlet Seven Sorrows p7 Pal.etm 1109 6bb5e675d17e203e
+50430001/Xyanide p18 ntsc.etm 1629 90675cef7eb0feb5
+5343000E/EVT-RTRP.ETM 2065 34b361b01dcae70e
+534300F9/Commandos Strk Frc p6 pal.etm 951 38fd415ede509e71
+544D0013/Knights Of The Temple 2 P9.etm 1380 f9892fe6a7036d42
+544D0013/Knights of the Temple 2 p9 ntsc.etm 1380 7b3ddbcd1e4e5715
+54540004/Serious Sam [plus9].etm 2063 5bc1ea1106f0cfb5
+5454000F/Grand Theft Auto Vice City _13 PAL.etm 2043 920ae5ea5ecf7a58
+55530019/SCPT.ETM 1073 fdc268345b04126c
+55530019/Splinter Cell Pandora Tomorrow p6 pal.etm 1091 ca3b1fbf95fd2ce5
+5553001D/Prince of Persia SoT p12 ntsc.etm 1457 e9501c7f071fd039
+55530038/Splinter Cell CT p12 global.etm 1712 bffa6c5f6bbef62c
+5553005C/Darkwatch p5 pal.etm 1104 bcfbcfffa1389b92
+5553005E/evt-scda.etm 3363 9b8012783d1ea820
+5553005E/evt-scda11.etm 2266 2f1e62521eaf8934
+56550010/Outlaw Golf [plus6] (USA) (v0.2).etm 482 4f3dfd574f1a536d
+56550042/50 Cent Bulletproof p5 pal.etm 874 aa1e22a56b9aa99d

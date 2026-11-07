@@ -4,9 +4,17 @@
  * Text: glyphs rasterized by stb_truetype at the size they are drawn at
  * (pixels: crisp at any window size) into one atlas texture, shelf-packed,
  * looked up in an open-addressed table. A codepoint the bundled font lacks
- * (CJK) comes from the first system font that has it.
+ * (CJK) comes from the first system font that has it (read the first time
+ * one is needed).
+ *
+ * Two ways out, the same drawing: an SDL_Renderer on the dashboard's window,
+ * or in a game's process the overlay of the game's presenter (swapchain.h):
+ * the triangles of a frame gathered and handed over at its end, the window
+ * the presenter's throughout. The overlay's textures are the presenter's,
+ * the game's picture among them (ui_scene).
  */
 #include "native/app/ui/ui.h"
+#include "hw/xbox/hle/vk/swapchain.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -17,9 +25,17 @@
 #define STBTT_STATIC
 #include "stb_truetype.h"
 
-#define ATLAS 2048
 #define GLYPHS 8192         /* table slots (a power of two) */
 #define MAX_FACES 8
+
+enum { UB_BLEND = HLE_OV_BLEND, UB_ADD = HLE_OV_ADD, UB_PREMUL = HLE_OV_PREMUL };
+
+struct UiTex {
+    SDL_Texture *t;         /* the renderer's */
+    uint32_t ov;            /* the overlay's */
+    int w, h;
+    int blend;              /* UB_* */
+};
 
 typedef struct {
     stbtt_fontinfo info;
@@ -37,15 +53,31 @@ typedef struct {
 static struct {
     SDL_Window *win;
     SDL_Renderer *r;
-    SDL_Texture *atlas, *glow;
+    UiTex *atlas, *glow;
+    int atlas_n;            /* its side */
     Face face[MAX_FACES];   /* 0 regular, 1 bold, 2.. fallbacks */
     int nfaces;
+    bool fallbacks;         /* the system's fonts looked for */
     Glyph g[GLYPHS];
     int shelf_x, shelf_y, shelf_h;
     float scale;            /* pixels per 720p unit */
     int pw, ph;
     uint64_t t0;
+    float alpha;            /* ui_set_alpha */
+    SDL_Texture *targets[8];   /* the layers' render targets under the one drawn into */
+    int ntargets;
+    /* the overlay's */
+    bool ov, cover;
+    void (*present)(void);
+    void (*size)(int *w, int *h);
+    int32_t clip[4];
+    HleOvVert *v;
+    HleOvCmd *c;
+    int nv, cv, nc, cc;
 } U;
+
+static UiTex g_scene = {.ov = HLE_OV_SCENE, .blend = UB_BLEND};
+static UiTex g_scene_blur = {.ov = HLE_OV_SCENE_BLUR, .blend = UB_BLEND};
 
 UiColor ui_mix(UiColor a, UiColor b, float t)
 {
@@ -58,6 +90,250 @@ static SDL_FColor fc(UiColor c)
 {
     return (SDL_FColor){c.r / 255.f, c.g / 255.f, c.b / 255.f, c.a / 255.f};
 }
+
+static float clamp01(float x)
+{
+    return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+/* ------------------------------------------------------------ the two ways out */
+
+/* A vertex's colour as drawn: the fade applied, premultiplied for a
+ * premultiplied texture. */
+static SDL_FColor vcol(SDL_FColor c, int blend)
+{
+    c.a *= U.alpha;
+    if (blend == UB_PREMUL) {
+        c.r *= c.a;
+        c.g *= c.a;
+        c.b *= c.a;
+    }
+    return c;
+}
+
+static uint32_t pack(SDL_FColor c)
+{
+    const uint32_t r = (uint32_t)lrintf(clamp01(c.r) * 255), g = (uint32_t)lrintf(clamp01(c.g) * 255);
+    const uint32_t b = (uint32_t)lrintf(clamp01(c.b) * 255), a = (uint32_t)lrintf(clamp01(c.a) * 255);
+    return r | g << 8 | b << 16 | a << 24;
+}
+
+/* Room for n more of the overlay's vertices in the command of texture tex
+ * (a new one when the texture, blending or clip changes). */
+static HleOvVert *ov_room(uint32_t tex, int blend, int n)
+{
+    if (U.nv + n > U.cv) {
+        U.cv = (U.nv + n) * 2;
+        U.v = SDL_realloc(U.v, (size_t)U.cv * sizeof(*U.v));
+    }
+    HleOvCmd *last = U.nc ? &U.c[U.nc - 1] : NULL;
+    if (last && last->tex == tex && last->blend == (uint32_t)blend && !memcmp(last->clip, U.clip, sizeof(U.clip)) &&
+        last->first + last->count == (uint32_t)U.nv) {
+        last->count += (uint32_t)n;
+    } else {
+        if (U.nc == U.cc) {
+            U.cc = U.cc ? U.cc * 2 : 64;
+            U.c = SDL_realloc(U.c, (size_t)U.cc * sizeof(*U.c));
+        }
+        HleOvCmd *c = &U.c[U.nc++];
+        c->tex = tex;
+        c->blend = (uint32_t)blend;
+        memcpy(c->clip, U.clip, sizeof(U.clip));
+        c->first = (uint32_t)U.nv;
+        c->count = (uint32_t)n;
+    }
+    HleOvVert *v = U.v + U.nv;
+    U.nv += n;
+    return v;
+}
+
+/* Triangles in window pixels, textured by t (NULL: plain colour). */
+static void geom(UiTex *t, const SDL_Vertex *v, int nv, const int *idx, int ni)
+{
+    const int blend = t ? t->blend : UB_BLEND;
+    if (U.ov) {
+        if (t && !t->ov) {
+            return;
+        }
+        HleOvVert *o = ov_room(t ? t->ov : 0, blend, ni);
+        for (int i = 0; i < ni; i++) {
+            const SDL_Vertex *s = &v[idx[i]];
+            o[i] = (HleOvVert){s->position.x, s->position.y, s->tex_coord.x, s->tex_coord.y, pack(vcol(s->color, blend))};
+        }
+        return;
+    }
+    if ((U.alpha >= 1.0f && blend != UB_PREMUL) || nv > 512) {
+        SDL_RenderGeometry(U.r, t ? t->t : NULL, v, nv, idx, ni);
+        return;
+    }
+    SDL_Vertex f[512];
+    for (int i = 0; i < nv; i++) {
+        f[i] = v[i];
+        f[i].color = vcol(v[i].color, blend);
+    }
+    SDL_RenderGeometry(U.r, t ? t->t : NULL, f, nv, idx, ni);
+}
+
+/* src of t (its pixels; NULL all) into dst (window pixels), modulated by c. */
+static void blit(UiTex *t, const SDL_FRect *src, const SDL_FRect *dst, UiColor c)
+{
+    if (!t) {
+        return;
+    }
+    if (U.ov) {
+        if (!t->ov) {
+            return;
+        }
+        float u0 = 0, v0 = 0, u1 = 1, v1 = 1;
+        if (src && t->w > 0 && t->h > 0) {
+            u0 = src->x / t->w;
+            v0 = src->y / t->h;
+            u1 = (src->x + src->w) / t->w;
+            v1 = (src->y + src->h) / t->h;
+        }
+        const uint32_t col = pack(vcol(fc(c), t->blend));
+        const float x0 = dst->x, y0 = dst->y, x1 = dst->x + dst->w, y1 = dst->y + dst->h;
+        HleOvVert *o = ov_room(t->ov, t->blend, 6);
+        o[0] = (HleOvVert){x0, y0, u0, v0, col};
+        o[1] = (HleOvVert){x1, y0, u1, v0, col};
+        o[2] = (HleOvVert){x1, y1, u1, v1, col};
+        o[3] = o[0];
+        o[4] = o[2];
+        o[5] = (HleOvVert){x0, y1, u0, v1, col};
+        return;
+    }
+    float a = c.a / 255.f * U.alpha;
+    if (t->blend == UB_PREMUL) {
+        c.r = (uint8_t)(c.r * a);
+        c.g = (uint8_t)(c.g * a);
+        c.b = (uint8_t)(c.b * a);
+    }
+    SDL_SetTextureColorMod(t->t, c.r, c.g, c.b);
+    SDL_SetTextureAlphaModFloat(t->t, a);
+    SDL_RenderTexture(U.r, t->t, src, dst);
+}
+
+static void tex_blend(UiTex *t, int blend)
+{
+    t->blend = blend;
+    if (t->t) {
+        SDL_SetTextureBlendMode(t->t, blend == UB_ADD      ? SDL_BLENDMODE_ADD
+                                      : blend == UB_PREMUL ? SDL_BLENDMODE_BLEND_PREMULTIPLIED
+                                                           : SDL_BLENDMODE_BLEND);
+    }
+}
+
+/* A w x h texture (px rows pitch bytes apart; NULL: left transparent). */
+static UiTex *tex_new(int w, int h, const uint8_t *px, int pitch)
+{
+    if (w <= 0 || h <= 0) {
+        return NULL;
+    }
+    UiTex *t = SDL_calloc(1, sizeof(*t));
+    t->w = w;
+    t->h = h;
+    if (U.ov) {
+        t->ov = hle_ov_tex_new((uint32_t)w, (uint32_t)h);
+        if (!t->ov) {
+            SDL_free(t);
+            return NULL;
+        }
+        if (px) {
+            hle_ov_tex_put(t->ov, 0, 0, (uint32_t)w, (uint32_t)h, px, (uint32_t)pitch);
+        }
+    } else {
+        t->t = SDL_CreateTexture(U.r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
+        if (!t->t) {
+            SDL_free(t);
+            return NULL;
+        }
+        if (px) {
+            SDL_UpdateTexture(t->t, NULL, px, pitch);
+        }
+        SDL_SetTextureScaleMode(t->t, SDL_SCALEMODE_LINEAR);
+    }
+    tex_blend(t, UB_BLEND);
+    return t;
+}
+
+static void tex_put(UiTex *t, const SDL_Rect *rc, const uint8_t *px, int pitch)
+{
+    if (t->ov) {
+        hle_ov_tex_put(t->ov, (uint32_t)rc->x, (uint32_t)rc->y, (uint32_t)rc->w, (uint32_t)rc->h, px, (uint32_t)pitch);
+    } else if (t->t) {
+        SDL_UpdateTexture(t->t, rc, px, pitch);
+    }
+}
+
+UiTex *ui_texture_rgba(const uint8_t *rgba, int w, int h)
+{
+    return tex_new(w, h, rgba, w * 4);
+}
+
+UiTex *ui_texture_surface(SDL_Surface *s)
+{
+    SDL_Surface *c = s ? SDL_ConvertSurface(s, SDL_PIXELFORMAT_RGBA32) : NULL;
+    if (!c) {
+        return NULL;
+    }
+    UiTex *t = tex_new(c->w, c->h, c->pixels, c->pitch);
+    SDL_DestroySurface(c);
+    return t;
+}
+
+void ui_texture_free(UiTex *t)
+{
+    if (!t || t == &g_scene || t == &g_scene_blur) {
+        return;
+    }
+    if (t->t) {
+        SDL_DestroyTexture(t->t);
+    }
+    if (t->ov) {
+        hle_ov_tex_free(t->ov);
+    }
+    SDL_free(t);
+}
+
+void ui_texture_size(const UiTex *t, float *w, float *h)
+{
+    *w = t ? (float)t->w : 0;
+    *h = t ? (float)t->h : 0;
+}
+
+UiTex *ui_scene(bool blurred)
+{
+    if (!U.ov) {
+        return NULL;
+    }
+    UiTex *t = blurred ? &g_scene_blur : &g_scene;
+    t->w = U.pw;
+    t->h = U.ph;
+    return t;
+}
+
+void ui_fill(UiTex *t, UiColor c)
+{
+    const SDL_FRect d = {0, 0, (float)U.pw, (float)U.ph};
+    blit(t, NULL, &d, c);
+}
+
+void ui_set_alpha(float a)
+{
+    U.alpha = clamp01(a);
+}
+
+void ui_cover(bool on)
+{
+    U.cover = on;
+}
+
+bool ui_is_overlay(void)
+{
+    return U.ov;
+}
+
+/* ------------------------------------------------------------ fonts */
 
 static unsigned char *read_file(const char *path)
 {
@@ -97,6 +373,7 @@ static void fallback_fonts(void)
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 #endif
     };
+    U.fallbacks = true;
     for (size_t i = 0; i < sizeof(k_paths) / sizeof(k_paths[0]) && U.nfaces < MAX_FACES; i++) {
         if (face_load(&U.face[U.nfaces], k_paths[i], 0)) {
             U.nfaces++;
@@ -104,7 +381,7 @@ static void fallback_fonts(void)
     }
 }
 
-static SDL_Texture *make_glow(void)
+static UiTex *make_glow(void)
 {
     enum { N = 128 };
     uint8_t *px = SDL_malloc(N * N * 4);
@@ -119,10 +396,33 @@ static SDL_Texture *make_glow(void)
             p[3] = (uint8_t)(a * 255);
         }
     }
-    SDL_Texture *t = ui_texture_rgba(px, N, N);
+    UiTex *t = ui_texture_rgba(px, N, N);
     SDL_free(px);
-    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_ADD);
+    if (t) {
+        tex_blend(t, UB_ADD);
+    }
     return t;
+}
+
+/* the fonts and the textures every frame may use */
+static bool init_common(const char *font_dir)
+{
+    char p[1024];
+    snprintf(p, sizeof(p), "%sPlay-Regular.ttf", font_dir);
+    if (!face_load(&U.face[0], p, 0)) {
+        SDL_Log("ui: no font at %s", p);
+        return false;
+    }
+    snprintf(p, sizeof(p), "%sPlay-Bold.ttf", font_dir);
+    if (!face_load(&U.face[1], p, 0)) {
+        U.face[1] = U.face[0];
+    }
+    U.nfaces = 2;
+    U.atlas = tex_new(U.atlas_n, U.atlas_n, NULL, 0);
+    U.glow = make_glow();
+    U.t0 = SDL_GetTicksNS();
+    U.alpha = 1.0f;
+    return U.atlas != NULL;
 }
 
 bool ui_init(SDL_Window *win, const char *font_dir)
@@ -140,33 +440,26 @@ bool ui_init(SDL_Window *win, const char *font_dir)
     SDL_SetRenderVSync(U.r, 1);
     /* shapes (untextured geometry) blend with what is under them */
     SDL_SetRenderDrawBlendMode(U.r, SDL_BLENDMODE_BLEND);
-    char p[1024];
-    snprintf(p, sizeof(p), "%sPlay-Regular.ttf", font_dir);
-    if (!face_load(&U.face[0], p, 0)) {
-        SDL_Log("ui: no font at %s", p);
-        return false;
-    }
-    snprintf(p, sizeof(p), "%sPlay-Bold.ttf", font_dir);
-    if (!face_load(&U.face[1], p, 0)) {
-        U.face[1] = U.face[0];
-    }
-    U.nfaces = 2;
-    fallback_fonts();
-    U.atlas = SDL_CreateTexture(U.r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, ATLAS, ATLAS);
-    SDL_SetTextureBlendMode(U.atlas, SDL_BLENDMODE_BLEND);
-    SDL_SetTextureScaleMode(U.atlas, SDL_SCALEMODE_LINEAR);
-    U.glow = make_glow();
-    U.t0 = SDL_GetTicksNS();
-    return true;
+    U.atlas_n = 2048;
+    return init_common(font_dir);
+}
+
+bool ui_init_overlay(const char *font_dir, void (*present)(void), void (*size)(int *w, int *h))
+{
+    memset(&U, 0, sizeof(U));
+    U.ov = true;
+    U.present = present;
+    U.size = size;
+    U.atlas_n = 1024;       /* a menu's glyphs, at any window size */
+    return init_common(font_dir);
 }
 
 void ui_shutdown(void)
 {
-    if (U.atlas) {
-        SDL_DestroyTexture(U.atlas);
-    }
-    if (U.glow) {
-        SDL_DestroyTexture(U.glow);
+    ui_texture_free(U.atlas);
+    ui_texture_free(U.glow);
+    if (U.ov && U.nc) {
+        hle_present_set_overlay(NULL, 0, NULL, 0, 0);
     }
     if (U.r) {
         SDL_DestroyRenderer(U.r);
@@ -176,6 +469,8 @@ void ui_shutdown(void)
             SDL_free(U.face[i].data);
         }
     }
+    SDL_free(U.v);
+    SDL_free(U.c);
     memset(&U, 0, sizeof(U));
 }
 
@@ -186,18 +481,72 @@ SDL_Renderer *ui_renderer(void)
 
 void ui_begin(void)
 {
-    SDL_GetCurrentRenderOutputSize(U.r, &U.pw, &U.ph);
+    if (U.ov) {
+        U.size(&U.pw, &U.ph);
+        if (U.pw < 1 || U.ph < 1) {
+            U.pw = 1280;
+            U.ph = 720;
+        }
+        U.nv = U.nc = 0;
+        memset(U.clip, 0, sizeof(U.clip));
+        U.cover = false;
+    } else {
+        SDL_GetCurrentRenderOutputSize(U.r, &U.pw, &U.ph);
+    }
     U.scale = U.ph / 720.0f;
     if (U.pw / U.scale < 960) {
         U.scale = U.pw / 960.0f;   /* narrow windows: at least 960 units wide */
     }
-    SDL_SetRenderDrawColor(U.r, 0, 0, 0, 255);
-    SDL_RenderClear(U.r);
+    U.alpha = 1.0f;
+    if (!U.ov) {
+        SDL_SetRenderDrawColor(U.r, 0, 0, 0, 255);
+        SDL_RenderClear(U.r);
+    }
+}
+
+void ui_overlay_submit(bool cover)
+{
+    if (!U.ov) {
+        return;
+    }
+    if (cover && !U.nc) {
+        /* nothing drawn, still covering: black, not the picture */
+        HleOvVert *o = ov_room(0, UB_BLEND, 3);
+        memset(o, 0, 3 * sizeof(*o));
+    }
+    hle_present_set_overlay(U.v, (uint32_t)U.nv, U.c, (uint32_t)U.nc, cover ? HLE_OV_COVER : 0);
+}
+
+void ui_overlay_off(void)
+{
+    if (U.ov) {
+        hle_present_set_overlay(NULL, 0, NULL, 0, 0);
+    }
 }
 
 void ui_end(void)
 {
+    if (U.ov) {
+        ui_overlay_submit(U.cover);
+        if (U.present) {
+            U.present();
+        }
+        return;
+    }
     SDL_RenderPresent(U.r);
+}
+
+void ui_shot(const char *path)
+{
+    if (U.ov) {
+        hle_present_shot(path);
+        return;
+    }
+    SDL_Surface *s = SDL_RenderReadPixels(U.r, NULL);
+    if (s) {
+        SDL_SaveBMP(s, path);
+        SDL_DestroySurface(s);
+    }
 }
 
 float ui_w(void)
@@ -264,6 +613,9 @@ static const Glyph *glyph(uint32_t cp, int style, int px)
         /* not cached: the first face with the codepoint */
         Face *f = &U.face[style == UI_FONT_BOLD ? 1 : 0];
         int gi = stbtt_FindGlyphIndex(&f->info, cp);
+        if (!gi && !U.fallbacks && cp > ' ') {
+            fallback_fonts();
+        }
         for (int i = 2; !gi && i < U.nfaces; i++) {
             if ((gi = stbtt_FindGlyphIndex(&U.face[i].info, cp))) {
                 f = &U.face[i];
@@ -274,12 +626,12 @@ static const Glyph *glyph(uint32_t cp, int style, int px)
         stbtt_GetGlyphHMetrics(&f->info, gi, &adv, &lsb);
         stbtt_GetGlyphBitmapBox(&f->info, gi, sc, sc, &x0, &y0, &x1, &y1);
         const int w = x1 - x0, hh = y1 - y0;
-        if (U.shelf_x + w + 1 > ATLAS) {
+        if (U.shelf_x + w + 1 > U.atlas_n) {
             U.shelf_x = 0;
             U.shelf_y += U.shelf_h + 1;
             U.shelf_h = 0;
         }
-        if (U.shelf_y + hh + 1 > ATLAS) {
+        if (U.shelf_y + hh + 1 > U.atlas_n) {
             atlas_reset();      /* full: start over (glyphs redraw as needed) */
             return glyph(cp, style, px);
         }
@@ -304,7 +656,7 @@ static const Glyph *glyph(uint32_t cp, int style, int px)
                 rgba[i * 4 + 3] = a[i];
             }
             const SDL_Rect rc = {U.shelf_x, U.shelf_y, w, hh};
-            SDL_UpdateTexture(U.atlas, &rc, rgba, w * 4);
+            tex_put(U.atlas, &rc, rgba, w * 4);
             SDL_free(a);
             SDL_free(rgba);
         }
@@ -324,8 +676,6 @@ static float text_run(float x, float y, const char *s, float size, int font, UiC
     const int px = (int)lrintf(size * U.scale);
     float pen = x * U.scale;
     const float start = pen;
-    SDL_SetTextureColorMod(U.atlas, c.r, c.g, c.b);
-    SDL_SetTextureAlphaMod(U.atlas, c.a);
     while (*s) {
         const char *at = s;
         const uint32_t cp = utf8_next(&s);
@@ -342,7 +692,7 @@ static float text_run(float x, float y, const char *s, float size, int font, UiC
         if (draw && g->w) {
             const SDL_FRect src = {g->x, g->y, g->w, g->h};
             const SDL_FRect dst = {floorf(pen) + g->xoff, floorf(y * U.scale) + g->yoff, g->w, g->h};
-            SDL_RenderTexture(U.r, U.atlas, &src, &dst);
+            blit(U.atlas, &src, &dst, c);
         }
         pen += g->adv;
     }
@@ -393,7 +743,7 @@ static void quad(float x, float y, float w, float h, UiColor c0, UiColor c1, UiC
         {{x * s, (y + h) * s}, fc(c3), {0, 0}},
     };
     static const int idx[6] = {0, 1, 2, 0, 2, 3};
-    SDL_RenderGeometry(U.r, NULL, v, 4, idx, 6);
+    geom(NULL, v, 4, idx, 6);
 }
 
 void ui_rect(float x, float y, float w, float h, UiColor c)
@@ -441,7 +791,7 @@ void ui_round(float x, float y, float w, float h, float r, UiColor c)
         idx[i * 3 + 1] = i + 1;
         idx[i * 3 + 2] = (i + 1) % n + 1;
     }
-    SDL_RenderGeometry(U.r, NULL, v, n + 1, idx, n * 3);
+    geom(NULL, v, n + 1, idx, n * 3);
 }
 
 static void strip(const SDL_FPoint *pt, int n, float t, UiColor c, bool closed)
@@ -472,7 +822,7 @@ static void strip(const SDL_FPoint *pt, int n, float t, UiColor c, bool closed)
         idx[k++] = a + 1;
         idx[k++] = b + 1;
     }
-    SDL_RenderGeometry(U.r, NULL, v, n * 2, idx, k);
+    geom(NULL, v, n * 2, idx, k);
 }
 
 void ui_round_outline(float x, float y, float w, float h, float r, float t, UiColor c)
@@ -481,29 +831,34 @@ void ui_round_outline(float x, float y, float w, float h, float r, float t, UiCo
     strip(pt, round_path(x, y, w, h, r, pt), t, c, true);
 }
 
-void ui_line(float x0, float y0, float x1, float y1, float t, UiColor c)
+/* a line in window pixels, t wide */
+static void line_px(float x0, float y0, float x1, float y1, float t, UiColor c)
 {
     float dx = x1 - x0, dy = y1 - y0;
     const float l = sqrtf(dx * dx + dy * dy);
     if (l <= 0) {
         return;
     }
-    const float nx = -dy / l * t / 2, ny = dx / l * t / 2, s = U.scale;
+    const float nx = -dy / l * t / 2, ny = dx / l * t / 2;
     const SDL_FColor col = fc(c);
-    SDL_Vertex v[4] = {{{(x0 + nx) * s, (y0 + ny) * s}, col, {0, 0}},
-                       {{(x1 + nx) * s, (y1 + ny) * s}, col, {0, 0}},
-                       {{(x1 - nx) * s, (y1 - ny) * s}, col, {0, 0}},
-                       {{(x0 - nx) * s, (y0 - ny) * s}, col, {0, 0}}};
+    SDL_Vertex v[4] = {{{x0 + nx, y0 + ny}, col, {0, 0}},
+                       {{x1 + nx, y1 + ny}, col, {0, 0}},
+                       {{x1 - nx, y1 - ny}, col, {0, 0}},
+                       {{x0 - nx, y0 - ny}, col, {0, 0}}};
     static const int idx[6] = {0, 1, 2, 0, 2, 3};
-    SDL_RenderGeometry(U.r, NULL, v, 4, idx, 6);
+    geom(NULL, v, 4, idx, 6);
+}
+
+void ui_line(float x0, float y0, float x1, float y1, float t, UiColor c)
+{
+    const float s = U.scale;
+    line_px(x0 * s, y0 * s, x1 * s, y1 * s, t * s, c);
 }
 
 void ui_glow(float cx, float cy, float r, UiColor c)
 {
-    SDL_SetTextureColorMod(U.glow, c.r, c.g, c.b);
-    SDL_SetTextureAlphaMod(U.glow, c.a);
     const SDL_FRect d = {(cx - r) * U.scale, (cy - r) * U.scale, 2 * r * U.scale, 2 * r * U.scale};
-    SDL_RenderTexture(U.r, U.glow, NULL, &d);
+    blit(U.glow, NULL, &d, c);
 }
 
 void ui_circle(float cx, float cy, float r, UiColor c)
@@ -523,60 +878,63 @@ void ui_ring(float cx, float cy, float rx, float ry, float rot, float t, UiColor
     strip(pt, n, t, c, true);
 }
 
-SDL_Texture *ui_texture_rgba(const uint8_t *rgba, int w, int h)
-{
-    SDL_Texture *t = SDL_CreateTexture(U.r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STATIC, w, h);
-    if (t) {
-        SDL_UpdateTexture(t, NULL, rgba, w * 4);
-        SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-        SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
-    }
-    return t;
-}
-
-void ui_image(SDL_Texture *t, float x, float y, float w, float h, float alpha)
+void ui_image(UiTex *t, float x, float y, float w, float h, float alpha)
 {
     if (!t) {
         return;
     }
-    float tw, th;
-    SDL_GetTextureSize(t, &tw, &th);
+    const float tw = (float)t->w, th = (float)t->h;
     const float k = fminf(w / tw, h / th), dw = tw * k, dh = th * k;
     const SDL_FRect d = {(x + (w - dw) / 2) * U.scale, (y + (h - dh) / 2) * U.scale, dw * U.scale, dh * U.scale};
-    SDL_SetTextureAlphaModFloat(t, alpha);
-    SDL_RenderTexture(U.r, t, NULL, &d);
+    blit(t, NULL, &d, (UiColor){255, 255, 255, (uint8_t)lrintf(clamp01(alpha) * 255)});
 }
 
 void ui_clip(float x, float y, float w, float h)
 {
     const SDL_Rect r = {(int)(x * U.scale), (int)(y * U.scale), (int)(w * U.scale), (int)(h * U.scale)};
+    if (U.ov) {
+        U.clip[0] = r.x;
+        U.clip[1] = r.y;
+        U.clip[2] = r.w > 0 ? r.w : 1;
+        U.clip[3] = r.h > 0 ? r.h : 1;
+        return;
+    }
     SDL_SetRenderClipRect(U.r, &r);
 }
 
 void ui_unclip(void)
 {
+    if (U.ov) {
+        memset(U.clip, 0, sizeof(U.clip));
+        return;
+    }
     SDL_SetRenderClipRect(U.r, NULL);
 }
 
 /* ------------------------------------------------------------ layers */
 
-SDL_Texture *ui_layer_begin(SDL_Texture *layer)
+UiTex *ui_layer_begin(UiTex *layer)
 {
-    float tw = 0, th = 0;
-    if (layer) {
-        SDL_GetTextureSize(layer, &tw, &th);
+    if (U.ov) {
+        return layer;           /* the overlay draws straight */
     }
-    if (!layer || (int)tw != U.pw || (int)th != U.ph) {
-        if (layer) {
-            SDL_DestroyTexture(layer);
-        }
-        layer = SDL_CreateTexture(U.r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, U.pw, U.ph);
+    if (!layer || layer->w != U.pw || layer->h != U.ph || !layer->t) {
+        ui_texture_free(layer);
+        layer = SDL_calloc(1, sizeof(*layer));
+        layer->w = U.pw;
+        layer->h = U.ph;
+        layer->t = SDL_CreateTexture(U.r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, U.pw, U.ph);
         /* drawn over a transparent target with plain blending: its colour is
          * premultiplied (and additive glows keep theirs where alpha is 0) */
-        SDL_SetTextureBlendMode(layer, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
-        SDL_SetTextureScaleMode(layer, SDL_SCALEMODE_LINEAR);
+        tex_blend(layer, UB_PREMUL);
+        if (layer->t) {
+            SDL_SetTextureScaleMode(layer->t, SDL_SCALEMODE_LINEAR);
+        }
     }
-    SDL_SetRenderTarget(U.r, layer);
+    if (U.ntargets < 8) {
+        U.targets[U.ntargets++] = SDL_GetRenderTarget(U.r);
+    }
+    SDL_SetRenderTarget(U.r, layer->t);
     SDL_SetRenderDrawColor(U.r, 0, 0, 0, 0);
     SDL_RenderClear(U.r);
     return layer;
@@ -584,12 +942,15 @@ SDL_Texture *ui_layer_begin(SDL_Texture *layer)
 
 void ui_layer_end(void)
 {
-    SDL_SetRenderTarget(U.r, NULL);
+    if (U.ov) {
+        return;
+    }
+    SDL_SetRenderTarget(U.r, U.ntargets ? U.targets[--U.ntargets] : NULL);
 }
 
-void ui_layer_draw3d(SDL_Texture *layer, float angle, float depth, float alpha)
+void ui_layer_draw3d(UiTex *layer, float angle, float depth, float alpha)
 {
-    if (!layer || alpha <= 0.003f) {
+    if (!layer || alpha <= 0.003f || U.ov) {
         return;
     }
     enum { COLS = 24 };
@@ -597,7 +958,7 @@ void ui_layer_draw3d(SDL_Texture *layer, float angle, float depth, float alpha)
     const float ca = cosf(angle), sa = sinf(angle);
     SDL_Vertex v[(COLS + 1) * 2];
     int idx[COLS * 6];
-    const SDL_FColor col = {alpha, alpha, alpha, alpha};   /* premultiplied */
+    const SDL_FColor col = {1, 1, 1, alpha};    /* premultiplied by geom (vcol) */
     for (int i = 0; i <= COLS; i++) {
         const float u = (float)i / COLS, X = (u - 0.5f) * W;
         const float z = X * sa + depth * W, x = X * ca;
@@ -614,7 +975,149 @@ void ui_layer_draw3d(SDL_Texture *layer, float angle, float depth, float alpha)
         idx[i * 6 + 4] = a + 2;
         idx[i * 6 + 5] = a + 3;
     }
-    SDL_RenderGeometry(U.r, layer, v, (COLS + 1) * 2, idx, COLS * 6);
+    geom(layer, v, (COLS + 1) * 2, idx, COLS * 6);
+}
+
+/* ------------------------------------------------------------ the transitions */
+
+static float hrand(uint32_t i)
+{
+    i ^= i >> 16;
+    i *= 0x7FEB352Du;
+    i ^= i >> 15;
+    i *= 0x846CA68Bu;
+    i ^= i >> 16;
+    return (float)(i & 0xFFFFFF) / 16777216.0f;
+}
+
+static float smooth01(float x)
+{
+    x = clamp01(x);
+    return x * x * (3 - 2 * x);
+}
+
+void ui_fx_shatter(UiTex *t, float k)
+{
+    if (!t) {
+        return;
+    }
+    enum { C = 8, R = 6, N = C * R * 2 };
+    const float W = (float)U.pw, H = (float)U.ph, cx = W / 2, cy = H / 2;
+    k = clamp01(k);
+    /* the break: a jittered grid, each cell two shards */
+    SDL_FPoint p[(C + 1) * (R + 1)];
+    for (int j = 0; j <= R; j++) {
+        for (int i = 0; i <= C; i++) {
+            float x = W * i / C, y = H * j / R;
+            if (i > 0 && i < C) {
+                x += (hrand((uint32_t)(j * 31 + i)) - 0.5f) * 0.7f * W / C;
+            }
+            if (j > 0 && j < R) {
+                y += (hrand((uint32_t)(j * 31 + i + 977)) - 0.5f) * 0.7f * H / R;
+            }
+            p[j * (C + 1) + i] = (SDL_FPoint){x, y};
+        }
+    }
+    SDL_FPoint tri[N][3];
+    int n = 0;
+    for (int j = 0; j < R; j++) {
+        for (int i = 0; i < C; i++) {
+            const SDL_FPoint a = p[j * (C + 1) + i], b = p[j * (C + 1) + i + 1];
+            const SDL_FPoint c = p[(j + 1) * (C + 1) + i + 1], d = p[(j + 1) * (C + 1) + i];
+            if (hrand((uint32_t)(j * 131 + i * 7 + 5)) < 0.5f) {
+                tri[n][0] = a, tri[n][1] = b, tri[n][2] = c, n++;
+                tri[n][0] = a, tri[n][1] = c, tri[n][2] = d, n++;
+            } else {
+                tri[n][0] = a, tri[n][1] = b, tri[n][2] = d, n++;
+                tri[n][0] = b, tri[n][1] = c, tri[n][2] = d, n++;
+            }
+        }
+    }
+    /* first the picture pushes at the viewer and cracks (a fifth of the
+     * time), then the shards fly at the viewer, turning, and fade */
+    const float crack = smooth01(k / 0.2f);
+    const float fly = k <= 0.2f ? 0 : (k - 0.2f) / 0.8f, e = fly * fly;
+    const float pre = 1.0f + 0.04f * crack;
+    const float fade = 1.0f - smooth01((fly - 0.4f) / 0.6f);
+    /* the nearer ones over the others */
+    int order[N];
+    float sc[N];
+    for (int i = 0; i < N; i++) {
+        order[i] = i;
+        sc[i] = 0.6f + 1.4f * hrand((uint32_t)(i * 7 + 3));
+    }
+    for (int i = 1; i < N; i++) {
+        const int o = order[i];
+        int j = i;
+        for (; j > 0 && sc[order[j - 1]] > sc[o]; j--) {
+            order[j] = order[j - 1];
+        }
+        order[j] = o;
+    }
+    for (int q = 0; q < N; q++) {
+        const int s = order[q];
+        const float r2 = hrand((uint32_t)(s * 7 + 5));
+        SDL_FPoint g = {(tri[s][0].x + tri[s][1].x + tri[s][2].x) / 3, (tri[s][0].y + tri[s][1].y + tri[s][2].y) / 3};
+        float dx = g.x - cx, dy = g.y - cy;
+        const float l = sqrtf(dx * dx + dy * dy);
+        dx = l > 1 ? dx / l : 0;
+        dy = l > 1 ? dy / l : -1;
+        const float dist = (0.25f + 0.55f * sc[s]) * W * e;
+        const float scale = pre * (1 + e * sc[s]);
+        const float ang = (r2 - 0.5f) * 3.4f * e;
+        const float ca = cosf(ang), sa = sinf(ang);
+        const SDL_FPoint G = {cx + (g.x - cx) * pre + dx * dist, cy + (g.y - cy) * pre + dy * dist + e * H * 0.2f * r2};
+        SDL_Vertex v[3];
+        for (int m = 0; m < 3; m++) {
+            const float ox = (tri[s][m].x - g.x) * scale, oy = (tri[s][m].y - g.y) * scale;
+            v[m] = (SDL_Vertex){{G.x + ox * ca - oy * sa, G.y + ox * sa + oy * ca},
+                                {1, 1, 1, fade},
+                                {tri[s][m].x / W, tri[s][m].y / H}};
+        }
+        static const int idx[3] = {0, 1, 2};
+        geom(t, v, 3, idx, 3);
+        /* the cracks: light along the edges as it breaks */
+        const float la = crack * (1 - smooth01(fly / 0.45f));
+        if (la > 0.01f) {
+            for (int m = 0; m < 3; m++) {
+                line_px(v[m].position.x, v[m].position.y, v[(m + 1) % 3].position.x, v[(m + 1) % 3].position.y,
+                        fmaxf(1.5f, H / 600.0f), (UiColor){255, 255, 255, (uint8_t)(200 * la)});
+            }
+        }
+    }
+    /* the flash at the break */
+    const float flash = crack * (1 - smooth01(fly / 0.35f));
+    if (flash > 0.01f) {
+        const float s = U.scale;
+        quad(0, 0, W / s, H / s, (UiColor){255, 255, 255, (uint8_t)(150 * flash)},
+             (UiColor){255, 255, 255, (uint8_t)(150 * flash)}, (UiColor){255, 255, 255, (uint8_t)(150 * flash)},
+             (UiColor){255, 255, 255, (uint8_t)(150 * flash)});
+    }
+}
+
+void ui_fx_flash_in(UiTex *t, float k, UiColor from)
+{
+    k = clamp01(k);
+    const float W = (float)U.pw, H = (float)U.ph, cx = W / 2, cy = H / 2;
+    const float e = 1 - (1 - k) * (1 - k) * (1 - k);
+    if (t) {
+        /* the picture rushing in, and its trail: larger copies, fainter */
+        for (int i = 0; i < 4; i++) {
+            const float s = 1 + (0.14f + 0.07f * i) * (1 - e);
+            const float a = i == 0 ? 1.0f : 0.30f * (1 - e) / (float)i;
+            if (a <= 0.004f) {
+                continue;
+            }
+            const SDL_FRect d = {cx - W * s / 2, cy - H * s / 2, W * s, H * s};
+            blit(t, NULL, &d, (UiColor){255, 255, 255, (uint8_t)lrintf(a * 255)});
+        }
+    }
+    const float w = (1 - k) * (1 - k);
+    if (w > 0.004f) {
+        const UiColor c = {from.r, from.g, from.b, (uint8_t)lrintf(from.a * w)};
+        const float s = U.scale;
+        quad(0, 0, W / s, H / s, c, c, c, c);
+    }
 }
 
 /* ------------------------------------------------------------ the console's look */

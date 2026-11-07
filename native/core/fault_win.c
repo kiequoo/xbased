@@ -21,11 +21,19 @@ static NcCore *g_fault_core;
 static LONG CALLBACK on_exception(PEXCEPTION_POINTERS ep)
 {
     const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+#ifdef _WIN32
+    if (g_fault_core && (er->ExceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO || er->ExceptionCode == EXCEPTION_INT_OVERFLOW)) {
+        /* a guest DIV/IDIV's #DE in translated code */
+        info.si_signo = SIGFPE;
+        return nc_core_fault(g_fault_core, SIGFPE, &info, ep->ContextRecord) ? EXCEPTION_CONTINUE_EXECUTION
+                                                                             : EXCEPTION_CONTINUE_SEARCH;
+    }
+#endif
     if (!g_fault_core || er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    siginfo_t info;
-    memset(&info, 0, sizeof(info));
     info.si_signo = SIGSEGV;
     info.si_addr = (void *)er->ExceptionInformation[1];
 #ifdef _WIN32

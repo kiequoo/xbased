@@ -2749,8 +2749,19 @@ static int mcpx_apu_default_vp_worker_count(void)
      * four workers took 37% of a core where two took 27% and one 25%, when
      * the frame thread only waited for them. NC_APU_WORKERS overrides
      * (g_apu_config).
+     *
+     * Desktop Linux: one, the frame thread alone. The helper's wake and wait
+     * cost more there than its share of the voices: a race in Forza
+     * Motorsport (5.1) kept the frame thread busy 19% of the time with two
+     * and 7% with one (Windows on the same machine: 8% with two, 11% with
+     * one), and on a slower laptop busy enough to run the output dry.
      */
+#if defined(NC_DESKTOP) && !defined(_WIN32)
+    (void)cpu_count;
+    return 1;
+#else
     return cpu_count <= 2 ? 1 : 2;
+#endif
 }
 
 static void voice_work_init(MCPXAPUState *d)
@@ -2762,6 +2773,8 @@ static void voice_work_init(MCPXAPUState *d)
         num_workers = mcpx_apu_default_vp_worker_count();
     }
     vwd->num_workers = MAX(1, MIN(num_workers, MAX_VOICE_WORKERS));
+    nc_log("hakuX-apu", "voices: %d share%s (the frame thread%s)", vwd->num_workers, vwd->num_workers > 1 ? "s" : "",
+           vwd->num_workers > 1 ? " and helpers" : " alone");
     vwd->workers = calloc(vwd->num_workers, sizeof(VoiceWorker));
     vwd->workers_should_exit = false;
     vwd->workers_pending = 0;

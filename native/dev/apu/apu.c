@@ -302,6 +302,8 @@ static void sleep_until(MCPXAPUState *d, int64_t deadline_us)
     }
 }
 
+static void monitor_fit(MCPXAPUState *d, int drain_bytes);
+
 static void throttle(MCPXAPUState *d)
 {
     /* GP frames one at a time, as the hardware runs them. The GP DSP takes
@@ -322,6 +324,18 @@ static void throttle(MCPXAPUState *d)
 
     if (d->monitor.fifo_capacity_bytes <= 0) {
         return;
+    }
+
+    /* The device's callbacks larger than the ring was set for (PulseAudio,
+     * PipeWire: out.c fill): the watermarks follow. Kept for 512 frames,
+     * Burnout 3 on PulseAudio with 43 ms periods (callbacks of 635 frames)
+     * came up short 2136 times in three minutes, a gap of silence each. */
+    const int asked = apu_out_asked_max();
+    if (asked > d->monitor.device_buffer_bytes) {
+        monitor_fit(d, asked);
+        nc_log("hakuX-apu", "output callbacks of %d frames: %d to %d frames kept queued",
+               asked / (2 * g_apu_out_channels), d->monitor.queued_bytes_low / (2 * g_apu_out_channels),
+               d->monitor.queued_bytes_high / (2 * g_apu_out_channels));
     }
 
     int64_t start_us = apu_host_us();
@@ -514,12 +528,26 @@ static int getenv_int_clamped(const char *name, int min_value, int max_value,
     return (int)parsed;
 }
 
+/* The watermarks for callbacks of drain_bytes: the ring filled to four and
+ * paced in real time above two, within its capacity. Paced above one, a
+ * callback could find the ring at one callback and leave it empty, the next
+ * one's refilled in real time just as it came: the frame thread late by a
+ * few milliseconds (a game loading, the host busy), a short callback. */
+static void monitor_fit(MCPXAPUState *d, int drain_bytes)
+{
+    const int frame_bytes = g_apu_out_channels == 6 ? (int)sizeof(g_apu_frame6) : (int)sizeof(d->monitor.frame_buf);
+    const int max_high = MAX(d->monitor.fifo_capacity_bytes - frame_bytes, frame_bytes);
+    d->monitor.device_buffer_bytes = drain_bytes;
+    d->monitor.queued_bytes_high = MIN(4 * drain_bytes, max_high);
+    d->monitor.queued_bytes_low = MIN(2 * drain_bytes, d->monitor.queued_bytes_high / 2);
+}
+
 /* The output: a ring of NC_APU_FIFO_FRAMES EP frames (48), drained in
  * callbacks of NC_APU_SAMPLES frames (512, 10.7 ms). The frame thread fills
- * it to three callbacks and paces itself in real time above one: ~32 ms
- * queued. Callbacks of 2048 queued ~128 ms (~130 ms from the guest to the
- * speaker); with the callback non-blocking (fill), 512 and 256 ran a minute
- * of Halo 2 on the Odin 3 without a short callback. */
+ * it to four callbacks and paces itself in real time above two: 21 to 43 ms
+ * queued (monitor_fit). Callbacks of 2048 queued ~128 ms (~130 ms from the
+ * guest to the speaker); with the callback non-blocking (fill), 512 and 256
+ * ran a minute of Halo 2 on the Odin 3 without a short callback. */
 static void monitor_init(MCPXAPUState *d)
 {
     const char *st = getenv("HAKUX_APU_STATS");
@@ -538,11 +566,7 @@ static void monitor_init(MCPXAPUState *d)
     }
     drain_bytes = MAX(drain_bytes, fifo_frame_bytes);
     d->monitor.fifo_capacity_bytes = fifo_capacity_bytes;
-    int max_high = MAX(d->monitor.fifo_capacity_bytes - fifo_frame_bytes,
-                       fifo_frame_bytes);
-    d->monitor.device_buffer_bytes = drain_bytes;
-    d->monitor.queued_bytes_high = MIN(3 * drain_bytes, max_high);
-    d->monitor.queued_bytes_low = MIN(drain_bytes, d->monitor.queued_bytes_high);
+    monitor_fit(d, drain_bytes);
 }
 
 void mcpx_apu_reset(MCPXAPUState *d)

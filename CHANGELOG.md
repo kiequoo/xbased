@@ -1,5 +1,395 @@
 # xbased changelog
 
+## 1.0.55 (2026-11)
+
+### Fixes
+- A folder added while the library was still being read was never read
+  at all until xbased started again. It's read now, whenever it's added.
+  The same went for swapping one folder for another in Settings.
+- A game whose file was moved or renamed (and the second copy of a game,
+  when the copy that was shown went away) vanished from the library until
+  xbased started again. Now the library follows the file.
+- Reading a big library is much faster: each game's executable is no
+  longer read whole for its name and icon, only the few kilobytes those
+  are in. On a hard disk that took minutes for a few hundred games.
+- Pressing A on one of the game folders in Settings, Interface took it
+  out of the library at once. Taking a folder (or a game file) out now
+  asks first.
+- Games in subfolders were read once for each folder level they were
+  under (a library with a folder a game read every game twice).
+- Changing xbased.ini by hand while xbased was open was undone when it
+  closed, as it wrote its own copy over the file. It reads the file again
+  when it changes now, and a folder added there is scanned at once.
+
+### New
+- The library loads in the background and is playable meanwhile: a
+  counter in the corner says how many games are in so far, and the
+  selection stays on its game as others come in. A game started while it
+  loads plays as usual (the library reads gently meanwhile).
+- The library is kept: the next time xbased starts, every game shows at
+  once, before the folders are checked again. A disk that isn't plugged
+  in keeps its games for when it is.
+- Search: Y (Tab, F3 or Ctrl+F) on the Games screen. Type the name with
+  the keyboard or, with a gamepad, on the on-screen keyboard. It matches
+  the game's name and its file's. The same screen filters by publisher,
+  year and region, and sets the order and the view. B on the Games screen
+  clears the search.
+- Order by name (numbers first, then A to Z), by publisher or by year.
+  The triggers (Z and C on the keyboard) jump to the next letter,
+  publisher or year, which shows big for a moment.
+- Three views: large covers (as before), small covers (about four times
+  as many on the screen) and icons with names, publishers and years. The
+  View button (V) switches between them.
+- Favorites: Add to favorites on a game's page. They come first, A to Z,
+  with a star.
+- The last game played comes first.
+- Both can be turned off, in the search screen or Settings, Interface.
+- A game's page shows its publisher and year.
+
+## 1.0.54 (2026-11)
+
+### New
+- A file browser of xbased's own for adding games, made for the gamepad
+  and just as usable with the keyboard or the mouse. Before, adding games
+  opened the system's file dialog, which a gamepad can't drive.
+  - Open it from the new **Add games** card at the end of the Games grid
+    (or with A when the library is empty), or from Settings, Interface.
+  - On the left are your places: the library's folders, your home,
+    desktop, documents and downloads folders, and every drive with its
+    name, file system and free space. On Linux that's the disks your
+    desktop mounts (/media, /run/media), anything mounted in /mnt and
+    any other real disk, from ext4, Btrfs and XFS to FAT32, exFAT, NTFS
+    and network shares.
+  - On the right is the folder you're in: its folders first, then its
+    disc images. Y shows the other files too. Hidden and system folders
+    stay out.
+  - A opens a folder, or adds a single game image to the library after
+    checking it really is one. X (or the Add this folder button) adds
+    the folder you're in. Adding a folder that holds folders or files
+    already in the library merges them into it. Everything that's
+    already in the library is marked as such.
+  - B goes up a folder and keeps your place in the list, left and right
+    move between the two sides, LB and RB page through long folders.
+    With the mouse, a click opens, the wheel scrolls and a right click
+    goes back.
+  - Folders are read in the background, so a slow USB disk or network
+    share doesn't freeze the dashboard, and the browser opens where you
+    left it last time.
+- The same browser replaces the other file dialogs too: playing a game
+  file without adding it, choosing a game's cover image, and finding
+  xemu.toml for importing xemu saves.
+
+## 1.0.53 (2026-11)
+
+### Fixes
+- Test Drive no longer hangs on its loading screen before a race. The
+  race executable keeps a slot for each of its data archives, and after
+  reading an archive's header it closes the file but keeps the handle in
+  the slot, then closes that same handle again when it frees the slot.
+  xbased always gave out the lowest free handle number, so by then the
+  number belonged to the game's loader thread, and the game lost its
+  loader and waited for it forever while it filled up memory. Handles
+  are now given out in turn around the table, so a number that was just
+  closed isn't handed out again straight away.
+- Test Drive's loading screen shows its Pong inside the dashboard screen
+  again instead of on black. The game draws it over the menu's last frame
+  without clearing it, relying on the console keeping its memory when it
+  reboots into the race executable. xbased started each executable with
+  clean memory; what the last one left in memory is now carried over, and
+  a block the next one allocates there gets it back, as on the console.
+- The frame a game keeps on screen for its next executable is now also
+  saved when the game has shut its GPU channel down before the reboot.
+  Thanks to BloodRaynare for the report (#88).
+
+## 1.0.52 (2026-11)
+
+### Fixes
+- RalliSport Challenge no longer says the console doesn't have enough
+  free blocks when you create a profile. Before saving one, the game
+  makes a file named with a single space in its save folder. The
+  console's file system takes that name, but Windows drops spaces at the
+  end of a name, so the file became the save folder itself, creating it
+  failed and the game took that as a full disk. Names Windows can't hold
+  (ending in a space or a dot, or a device name like CON or NUL) are now
+  stored on the host with those characters written as =XX, and the game
+  sees them exactly as it named them. Profiles now get created and saved,
+  races start, and the profile is still there after restarting. Thanks to
+  Archive82-star for the report (#92).
+
+## 1.0.51 (2026-11)
+
+### Fixes
+- FIFA World Cup: Germany 2006 no longer freezes at start on every boot
+  after the first. On its first boot the game copies its data to a cache
+  drive, and from then on a helper thread checks that cache while the
+  game starts. The game pauses that helper by waiting for it to reach a
+  safe point, giving up the CPU in the meantime, but the helper runs at a
+  lower priority and the emulator only ever handed the CPU to threads of
+  the same priority or higher, so it never got to run and the game waited
+  forever. Giving up the CPU now lets a lower priority thread run, as on
+  the console. Checked over five boots in a row with the cache in place,
+  each reaching the intro. Thanks to RiasatSalminSami for the report (#89).
+
+## 1.0.50 (2026-11)
+
+### Fixes
+- Steadier frame pacing on high refresh rate and variable refresh rate
+  displays (G-Sync, FreeSync). xbased used to send each frame out on the
+  first refresh of the display after it was ready, so at 60 fps on a 144
+  or 280 Hz display frames went out anywhere from 8 to 26 ms apart. A
+  variable refresh rate display refreshes when each frame arrives, so its
+  refresh rate swung all over the place and the game stuttered even at a
+  locked 60. On these displays frames now go out as soon as they're ready,
+  at the game's own pace (16.7 ms apart, give or take half a millisecond),
+  and the emulated console's clock no longer tries to follow refreshes
+  that aren't the display's real ones. On regular 60 and 120 Hz displays
+  nothing changes. Thanks to RiasatSalminSami for the report (#90).
+
+## 1.0.49 (2026-11)
+
+### Fixes
+- xbased now copes much better with slow drives, like external USB hard
+  disks and SD cards. Everything the emulated hard disk did on the host
+  ran on the emulated console's own CPU, so a slow drive held the whole
+  console while a game wrote to it. That's what froze Project Gotham
+  Racing 2's intro for minutes while it filled its cache. Now writes go
+  to a background thread like reads already did, so the game thread that
+  writes waits and the rest of the game keeps running. The hard disk also
+  has its own thread next to the DVD drive's, each write is a single
+  request instead of one per memory page, and wiping a cache drive
+  happens in the background. Files on the cache drives (X, Y and Z) are
+  also no longer forced to disk one by one as they're closed, since the
+  console treats those as disposable anyway. Saves still are. Thanks to
+  shadowflash for the report (#83).
+
+## 1.0.48 (2026-11)
+
+### Fixes
+- Loading a savestate no longer restarts the game after a few loads.
+  Every time xbased restarts itself (to load a state, or when a game
+  switches to another of its executables) it handed the new run all of
+  its settings again on top of the ones the new run reads anyway, so the
+  list kept growing until it was full and the last entries were lost,
+  among them the state to load. Some games that switch executables, like
+  Chicago Enforcer, could even end up restarting over and over. Now only
+  the options given on the command line are passed on, and loading the
+  same state five times in a row goes back to it every time. This also
+  covers loading from the in-game menu (F1). Thanks to antonio3687 for
+  the report (#81).
+
+## 1.0.47 (2026-11)
+
+### New
+- Stick anti dead zone, in Settings, Controls, Stick range, and for each
+  game in its own Controls. Many Xbox games ignore the first part of a
+  stick's travel themselves (they were made for the original controller's
+  loose sticks), so even with the dead zone at 0 a small push does
+  nothing. In Chicago Enforcer, for example, the view doesn't turn at all
+  until the stick is about a third of the way over. The anti dead zone
+  makes the smallest push past the dead zone start at that amount, so
+  the game reacts straight away. Both stick boxes on the Stick range
+  screen draw it as a red disc, next to the dead zone's grey ring.
+- A game's Controls now have its own sticks (dead zone, anti dead zone,
+  range, shape) and triggers, so each game can be set apart from the
+  global settings. Thanks to crashmidnick25 for the report (#84).
+
+## 1.0.46 (2026-11)
+
+### Fixes
+- Less audio stutter on Linux in games with a lot of sound going on,
+  like Forza Motorsport's races. The emulated sound chip's voices were
+  split between the audio thread and a helper thread, and on Linux
+  waking the helper and waiting for it 1500 times a second cost more
+  than the work it took over. In a Forza race the audio thread was busy
+  about three times as much on Linux as on Windows on the same machine,
+  and on slower laptops it couldn't keep up. On Linux the audio thread
+  now does the voices itself, which takes it from around 20% busy to
+  around 7% in that race. Windows keeps the helper, which pays off
+  there. Thanks to saultsomy-jpg for the report and the detailed log
+  (#82).
+
+## 1.0.45 (2026-11)
+
+### Fixes
+- Chicago Enforcer no longer freezes when starting a new game. Its
+  loading screen works with events it opens by name, and the emulator
+  had no way to open an object by name, so it stopped right there. Named
+  events, semaphores and mutants are now supported, and a name goes away
+  with the last handle to it, as on the console, since the next loading
+  screen waits for exactly that. The game now gets through both loads
+  of the first chapter and plays. Thanks to P1Login for the report (#56).
+
+## 1.0.44 (2026-11)
+
+### Fixes
+- The updater on Windows no longer gives up on an update that unpacked
+  fine. It unpacks the new version with Windows' own tar, and on some
+  Windows 10 machines tar reported an error even though every file came
+  out right, so the updater stopped and opened the releases page
+  instead. Now, when tar reports an error, the updater checks every
+  file of the package against the download (its name and size) and
+  carries on if they're all there. Thanks to shadowflash for the report
+  (#76).
+
+## 1.0.43 (2026-11)
+
+### Fixes
+- Crimson Skies: High Road to Revenge no longer goes back to the
+  dashboard as it starts. Some games check that the disc is an original
+  by reading its security sector, which lives in a part of the disc that
+  disc images don't include, and the emulator handed back zeros. The
+  emulated DVD drive now makes a security sector that passes the game's
+  check (the right time stamp and checksum, signed with a key of
+  xbased's own, which the emulated console uses as its public key). The
+  game now boots and plays. Thanks to BlueDragon992 for the report (#80).
+
+## 1.0.42 (2026-11)
+
+### Fixes
+- The console's language and video settings are now kept in step with
+  the console's EEPROM (hdd/eeprom.bin), both ways. Before, the
+  emulator wrote its own settings over the EEPROM every time a game
+  started, so editing eeprom.bin (as you would in xemu) did nothing.
+  Now a change made in eeprom.bin, by hand or by a game saving its
+  settings, shows up in Settings, and a change made in Settings is
+  written to eeprom.bin. The file also no longer picks up what was only
+  meant for one game, like that game's own language. Thanks to joesan09
+  and ArhumMK for the reports (#43).
+- A game's own language (its Game settings) is now always kept. Games
+  whose disc has an English folder but none for the chosen language
+  still fall back to English when the language comes from the global
+  setting, because some of them break otherwise, but choosing the
+  language for the game itself now overrides that.
+- In Game settings the language is either the global setting or a
+  language of its own. The separate Auto there, which followed the
+  interface's language rather than the global setting, is gone. In
+  Settings, Auto now says which language it gives.
+
+## 1.0.41 (2026-11)
+
+### Fixes
+- Sound no longer stutters and pops now and then, mostly while a game is
+  loading. The emulator kept only one block of sound ready ahead of what
+  the sound system takes at a time, so if it was a few milliseconds late
+  (the computer busy with a game's loading) the sound ran dry for a
+  moment and came back with a click. It now keeps two blocks ready, sized
+  from what the sound system actually asks for rather than what it was
+  asked for at the start. That matters most on Linux, where PulseAudio
+  and PipeWire can take bigger blocks than asked: with Burnout 3 on
+  PulseAudio taking 43 ms blocks, gaps went from over two thousand in
+  three minutes to one or two. Sound now runs about 10 ms further
+  behind the picture. Thanks to saultsomy-jpg for the report (#77).
+
+## 1.0.40 (2026-11)
+
+### Fixes
+- XIII no longer goes to a black screen after the logos. Its engine
+  catches an error in every function it passes through and throws it
+  again from there, so one error at boot ends up nine exceptions deep,
+  each still being handled when the next starts. The emulator kept at
+  most eight per thread and stopped the game past that. It now keeps up
+  to 64, and XIII reaches its menus and plays. Savestates made with older
+  versions still load. Thanks to P1Login for the report (#64).
+- Operation Flashpoint: Elite no longer goes to a black screen at boot.
+  It writes its cache files with gathered writes (one write from many
+  separate memory pages), a kernel call the emulator didn't have yet.
+  It's in now, and the game reaches its menus and missions. Thanks to
+  P1Login for the report (#63).
+- Total Immersion Racing no longer closes the emulator at its first logo
+  video. Reads a game starts in the background (overlapped reads) now
+  take a little time, as the console's drive does, instead of finishing
+  almost at once. The game counts on its first video read still being
+  under way when it first checks, and when it wasn't, the video's sound
+  was set up with no channels and the game divided by zero. Background
+  reads still run four times faster than the console's DVD drive. The
+  game now plays its videos and reaches its races. Thanks to P1Login for
+  the report (#65).
+- Hitman 2: Silent Assassin no longer goes to a black screen at boot.
+  It edits the console's page tables to see its memory at a second
+  address, by copying the entries the console's kernel keeps for its
+  RAM. The emulator gave it page tables without those entries, so the
+  copy came out empty and the game's first use of that memory failed.
+  The page tables now start the way the console's do, and the game
+  reaches its menus and levels. Thanks to P1Login for the report (#69).
+- On Windows, a game dividing by zero now leaves a line in the log
+  saying where, instead of the emulator closing without a word.
+
+## 1.0.39 (2026-11)
+
+### Fixes
+- Sniper Elite no longer stops on its first screen the first time it
+  runs. It copies its sound bank to the cache drive in writes that skip
+  the file system's cache, and waits for each one to be reported as
+  pending before it moves on. Those writes finished at once here, so the
+  game sent the same first block again and again forever. They now pend
+  as they do on the console's hard disk, the 135 MB copy finishes in a
+  few seconds, and the game plays. Thanks to P1Login for the report (#62).
+
+## 1.0.38 (2026-11)
+
+### The interface over the game
+The interface is now drawn by the game's own presenter, over the game's
+picture, so the window never changes hands while you play.
+
+- The in-game menu comes up over the paused game, blurred behind a
+  translucent veil, and fades in and out. Before, the presenter let go of
+  the window and another renderer drew the menu over a still picture.
+- Changing the screen shape in the menu shows at once on the picture
+  under it, and the picture eases into its new shape instead of jumping.
+- Saving a state and taking a screenshot show a short notice over the
+  game.
+
+### Overscan
+Settings > Video (and each game's settings) have an Overscan row, for any
+screen shape, 4:3 as much as 16:9. As on a TV, it's the share of the
+picture hidden past the screen's edges: 3% to 15%, where a CRT hid some
+5 to 10% (7% and 10% are the action-safe areas). The negative values
+underscan, leaving that much border. It shows at once, under the in-game
+menu too. Thanks to P1Login for asking (#67).
+
+### Transitions in and out of games
+- Starting a game: the dashboard breaks into shards that fly at you, and
+  the game comes in out of a white flash. Quitting to the dashboard or
+  restarting breaks the game's picture the same way, and the dashboard
+  comes back in out of black. Each takes half a second.
+- Loading a state, or a game switching to another of its executables:
+  the picture stays on screen until the new one is ready, then fades into
+  it. The next window opens under the current one, which closes only once
+  the new one has drawn, so there's no desktop or blank window between
+  them. A window keeps its place and size.
+- Settings > Interface > Transitions in and out of games turns the
+  effects off.
+
+None of this runs during gameplay. Checked against 1.0.37 on Conker's
+same scene: the same frame rate unlocked (840) and at Original (59.9, one
+dropped frame in each), and the same presenter timings.
+
+## 1.0.37 (2026-11)
+
+### Patches and cheats only for the build they were made for
+A game's releases can share a title ID and still have executables built
+apart (another region, a later printing), and a patch or cheat writes to
+fixed places of the one it was made for. xbased now tells them apart by
+the executable itself: its certificate's regions and its build time.
+
+- The shipped IPS patches (60 FPS, widescreen, 480p) were made and tested
+  on the North American releases. They're offered only on an executable
+  sold there, and only where each record fits its code. Grand Theft Auto:
+  Vice City's European release crashed with its 60 FPS patch, which cut
+  an instruction in half; it's no longer offered there. Patches you add
+  yourself are offered as before.
+- Cheat files: nearly all compare the build they were made for before
+  they patch anything. xbased reads those builds from each file (plain or
+  XOR-obscured) and lists a file only on its own build. Burnout 3's USA
+  disc lists its four trainers and none of the three for the later
+  printing. 36 files that patch without checking the build are out of the
+  collection, and an update deletes them while they're unchanged.
+
+Checked in game with the frame rate at Original: the 60 FPS patches of
+Driv3r, Rainbow Six 3, Prince of Persia: The Sands of Time and The Thing
+go from 30 to 60, and the widescreen patches of Conker and The Sands of
+Time widen the view.
+
 ## 1.0.36 (2026-11)
 
 ### Fixes

@@ -297,6 +297,68 @@ static bool move_over(const char *from, const char *to, const char *rel)
     return ok;
 }
 
+static uint32_t le16(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8;
+}
+
+static uint32_t le32(const uint8_t *p)
+{
+    return le16(p) | le16(p + 2) << 16;
+}
+
+/* Every file of the zip unpacked under dir at its size: its central
+ * directory read (the end record within the last 64 KiB, an entry a file
+ * header, 0x02014B50: its size at +24, its name's length at +28 and the
+ * name at +46). A Windows 10's tar was seen reporting an error with every
+ * file unpacked: the package is taken by what it left, not by what it said. */
+static bool zip_unpacked(const char *zip, const char *dir)
+{
+    size_t n = 0;
+    uint8_t *z = SDL_LoadFile(zip, &n);
+    if (!z || n < 22) {
+        SDL_free(z);
+        return false;
+    }
+    size_t end = n - 22, stop = n > 22 + 0x10000 ? n - 22 - 0x10000 : 0;
+    while (end > stop && le32(z + end) != 0x06054B50u) {
+        end--;
+    }
+    bool ok = le32(z + end) == 0x06054B50u;
+    const uint32_t entries = ok ? le16(z + end + 10) : 0;
+    size_t at = ok ? le32(z + end + 16) : 0;
+    unsigned files = 0;
+    for (uint32_t i = 0; ok && i < entries; i++) {
+        if (at + 46 > n || le32(z + at) != 0x02014B50u) {
+            ok = false;
+            break;
+        }
+        const uint32_t size = le32(z + at + 24), name_len = le16(z + at + 28);
+        const uint32_t skip = 46 + name_len + le16(z + at + 30) + le16(z + at + 32);
+        if (at + skip > n || name_len == 0 || name_len > 900) {
+            ok = false;
+            break;
+        }
+        const char *name = (const char *)z + at + 46;
+        if (name[name_len - 1] != '/' && name[name_len - 1] != '\\') {
+            char path[1200];
+            snprintf(path, sizeof(path), "%s/%.*s", dir, (int)name_len, name);
+            SDL_PathInfo pi;
+            if (!SDL_GetPathInfo(path, &pi) || pi.type != SDL_PATHTYPE_FILE || pi.size != size) {
+                nc_log("hakuX-app", "update: %.*s isn't unpacked whole", (int)name_len, name);
+                ok = false;
+            }
+            files++;
+        }
+        at += skip;
+    }
+    SDL_free(z);
+    if (ok) {
+        nc_log("hakuX-app", "update: tar reported an error, but all %u files of the package are unpacked", files);
+    }
+    return ok && files > 0;
+}
+
 static bool install(void)
 {
     const char *dir = install_dir();
@@ -316,7 +378,7 @@ static bool install(void)
     char tar[300];
     snprintf(tar, sizeof(tar), "%s\\System32\\tar.exe", root ? root : "C:\\Windows");
     const char *args[] = {tar, "-xf", zip, "-C", unpacked, NULL};
-    if (!run(args)) {
+    if (!run(args) && !zip_unpacked(zip, unpacked)) {
         nc_log("hakuX-app", "update: the package couldn't be unpacked");
         return false;
     }

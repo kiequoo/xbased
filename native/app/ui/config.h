@@ -22,6 +22,9 @@ typedef struct Config {
 
 void cfg_load(Config *c, const char *path);
 bool cfg_save(const Config *c);
+/* The file written by something else (a text editor, a game) since this
+ * process last read or wrote it. */
+bool cfg_changed_outside(const Config *c);
 const char *cfg_get(const Config *c, const char *key);    /* NULL: unset */
 int cfg_int(const Config *c, const char *key, int def);
 bool cfg_bool(const Config *c, const char *key, bool def);

@@ -400,6 +400,12 @@ bool nc_core_fault(NcCore *c, int sig, siginfo_t *info, void *ucontext)
 #else
     const uintptr_t pc = ((ucontext_t *)ucontext)->uc_mcontext.pc;
 #endif
+    if (sig == SIGFPE) {
+        /* A guest DIV/IDIV's divide error (fault_win.c): the Xbox kernel would
+         * hand it to the title's handlers, which a title rarely has; said
+         * where it happened rather than leaving the process gone unlogged. */
+        return fault_report(c, pc, 0, "divide error");
+    }
     if (sig == SIGBUS && nc_cpu_unaligned_fault(c->cpu, info->si_code, ucontext)) {
         /* Doom 3 keeps a critical section at 0x00BFD88E: RtlEnterCriticalSection's
          * lock inc of its LockCount (0x00BFD89E) took the core down */

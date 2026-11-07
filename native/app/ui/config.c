@@ -11,6 +11,39 @@
 #include <windows.h>
 #endif
 
+/* the files as this process last read or wrote them (their modification
+ * times): one written by something else since is cfg_changed_outside's */
+static struct {
+    char path[1024];
+    SDL_Time mtime;
+} g_seen[8];
+
+static SDL_Time file_time(const char *path)
+{
+    SDL_PathInfo pi;
+    return SDL_GetPathInfo(path, &pi) ? pi.modify_time : 0;
+}
+
+static void seen_now(const char *path)
+{
+    int k = 0;
+    while (k < 7 && g_seen[k].path[0] && strcmp(g_seen[k].path, path)) {
+        k++;
+    }
+    snprintf(g_seen[k].path, sizeof(g_seen[k].path), "%s", path);
+    g_seen[k].mtime = file_time(path);
+}
+
+bool cfg_changed_outside(const Config *c)
+{
+    for (int k = 0; k < 8 && g_seen[k].path[0]; k++) {
+        if (!strcmp(g_seen[k].path, c->path)) {
+            return file_time(c->path) != g_seen[k].mtime;
+        }
+    }
+    return false;
+}
+
 static void trim(char *s)
 {
     size_t n = strlen(s);
@@ -34,6 +67,7 @@ void cfg_load(Config *c, const char *path)
     memset(c, 0, sizeof(*c));
     snprintf(c->path, sizeof(c->path), "%s", p);
     path = c->path;
+    seen_now(path);
     FILE *f = fopen(path, "rb");
     if (!f) {
         return;
@@ -85,7 +119,9 @@ bool cfg_save(const Config *c)
     }
     fclose(f);
     remove(c->path);
-    return rename(tmp, c->path) == 0;
+    const bool ok = rename(tmp, c->path) == 0;
+    seen_now(c->path);
+    return ok;
 }
 
 static int find(const Config *c, const char *key)

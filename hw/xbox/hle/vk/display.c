@@ -33,6 +33,7 @@ static struct {
     HleDispStats st;
     bool present_late;          /* hle_disp_present_late */
     uint32_t want;              /* ... the latest swap presented before it was written */
+    uint32_t fronts;            /* frames made front so far (hle_disp_wait_front) */
 } g_disp;
 
 static void slot_free_vk(HleDispSlot *s)
@@ -176,6 +177,8 @@ static void to_front(int i, uint32_t swap_id)
     }
     g_disp.s[i].state = SLOT_FRONT;
     g_disp.st.presented++;
+    g_disp.fronts++;
+    hle_cond_broadcast(&g_disp.cond);   /* a presenter waiting for it (hle_disp_wait_front) */
     hle_hitch_frame(swap_id, HLE_FR_FRONT);
 }
 
@@ -458,6 +461,25 @@ void hle_disp_set_gamma(const uint8_t rgb[3][256], bool identity)
 uint32_t hle_disp_gamma_seq(void)
 {
     return hle_atomic_load_acquire(&g_gamma.seq);
+}
+
+uint32_t hle_disp_fronts(void)
+{
+    return hle_atomic_load_acquire(&g_disp.fronts);
+}
+
+bool hle_disp_wait_front(uint32_t seen, int ms)
+{
+    if (!hle_atomic_load_acquire(&g_disp.inited)) {
+        return false;
+    }
+    hle_mutex_lock(&g_disp.lock);
+    if (g_disp.fronts == seen && ms > 0) {
+        hle_cond_timedwait(&g_disp.cond, &g_disp.lock, ms);
+    }
+    const bool fresh = g_disp.fronts != seen;
+    hle_mutex_unlock(&g_disp.lock);
+    return fresh;
 }
 
 bool hle_disp_front(uint32_t *gen, uint32_t *swap_id)

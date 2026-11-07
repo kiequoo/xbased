@@ -208,6 +208,7 @@ bool nc_thrd_state_load(NcRd *r, unsigned v)
     k->isr_thread = thread_at(k, refs.isr_thread);
     k->isr_interrupted = thread_at(k, refs.isr_interrupted);
     k->resume_first = thread_at(k, refs.resume_first);
+    k->yield_from = k->yield_to = NULL;     /* a yield's quantum, not kept */
     g_point = refs.point;
     nc_log("hakuX-native-state", "threads: %u, current %d (%s)", n, refs.current,
            g_point == NC_STATE_AT_IDLE ? "idle: the scheduler picks first" : "at its kernel entry");
