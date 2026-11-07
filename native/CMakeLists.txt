@@ -210,3 +210,10 @@ if(WIN32)
 elseif(NC_LINUX_X64 OR NC_LINUX_ARM64)
   nc_linux_compat(hakux_native hakux_hle hakux_apu nc_glib nc_slirp xboxrun hakux)
 endif()
+
+# On arm64 the CPU backend is FEX, so hakux_native doesn't pull in Zydis the way
+# x86-64/Windows do; app/mod_fit.c still decodes the guest's x86-32 XBE on any
+# host, so link Zydis (and its include dirs) straight into hakux here.
+if(NC_LINUX_ARM64)
+  target_link_libraries(hakux PRIVATE nc_zydis)
+endif()

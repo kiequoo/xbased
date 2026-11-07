@@ -79,7 +79,11 @@ cmake -S native -B ../build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
 cmake --build ../build/linux --target hakux
 ```
 
-**arm64 cross-compile** (catches arm64 build errors without CI):
+**arm64 cross-compile** — run this **before every push**, including upstream syncs.
+The x86-64 build does not exercise the arm64 cmake wiring, so arm64-only breakage
+(e.g. a new upstream source that needs a dep only wired for x86-64) will silently
+pass x86-64 but fail CI. Pattern to watch: new files added to `app_win.cmake` may
+pull in headers that need a matching `add_subdirectory` in `linux_arm64.cmake`.
 ```bash
 tools/build_local.sh          # full build → build-arm64/xbased
 tools/build_local.sh build    # skip dep fetch
